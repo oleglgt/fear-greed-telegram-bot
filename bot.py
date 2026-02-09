@@ -6,6 +6,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -73,10 +74,27 @@ def fetch_fear_and_greed() -> tuple[float, str, str]:
     return float(score), str(rating), updated_at
 
 
+def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
+    response = requests.get(CRYPTO_API_URL, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    latest = data["data"][0]
+    score = int(latest["value"])
+    rating = str(latest["value_classification"])
+    timestamp_raw = latest["timestamp"]
+    dt_utc = parse_timestamp_utc(timestamp_raw)
+    updated_at = dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+
+    return score, rating, updated_at
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет! Я показываю Fear & Greed Index.\n"
-        "Команда: /fg"
+        "Команды:\n"
+        "/fg - stock (CNN)\n"
+        "/crypto или /cfg - crypto"
     )
 
 
@@ -92,12 +110,25 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Не удалось получить данные: {exc}")
 
 
+async def crypto_fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        score, rating, updated_at = fetch_crypto_fear_and_greed()
+        await update.message.reply_text(
+            f"Crypto Fear & Greed Index: {score}\n"
+            f"Состояние: {rating}\n"
+            f"Обновлено: {updated_at}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Не удалось получить crypto данные: {exc}")
+
+
 def main() -> None:
     token = get_token()
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
+    app.add_handler(CommandHandler(["crypto", "cfg"], crypto_fg))
 
     app.run_polling()
 
