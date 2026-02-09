@@ -18,6 +18,17 @@ REQUEST_HEADERS = {
 }
 
 
+def parse_timestamp_utc(timestamp_raw: object) -> datetime:
+    """
+    CNN may return timestamp as int/float/string.
+    Supports unix seconds and unix milliseconds.
+    """
+    ts = float(str(timestamp_raw).strip())
+    if ts > 1e12:
+        ts = ts / 1000.0
+    return datetime.utcfromtimestamp(ts)
+
+
 def get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if token:
@@ -46,9 +57,8 @@ def fetch_fear_and_greed() -> tuple[float, str, str]:
 
     score = data["fear_and_greed"]["score"]
     rating = data["fear_and_greed"]["rating"]
-    timestamp_ms = data["fear_and_greed"]["timestamp"]
-
-    dt_utc = datetime.utcfromtimestamp(timestamp_ms / 1000)
+    timestamp_raw = data["fear_and_greed"]["timestamp"]
+    dt_utc = parse_timestamp_utc(timestamp_raw)
     updated_at = dt_utc.strftime("%Y-%m-%d %H:%M UTC")
 
     return float(score), str(rating), updated_at
