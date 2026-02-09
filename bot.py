@@ -11,7 +11,8 @@ YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
-BOT_VERSION = "v1.5.2"
+FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
+BOT_VERSION = "v1.5.3"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -152,7 +153,7 @@ def fetch_market_prices() -> tuple[float, float]:
         except Exception:
             pass
 
-    # S&P fallback: Stooq (^SPX close price from CSV).
+    # S&P fallback 1: Stooq (^SPX close price from CSV).
     if spx_price is None:
         try:
             spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
@@ -161,7 +162,24 @@ def fetch_market_prices() -> tuple[float, float]:
             if len(lines) >= 2:
                 row = lines[1].split(",")
                 # CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
-                spx_price = float(row[6])
+                if len(row) > 6 and row[6] not in {"", "N/D"}:
+                    spx_price = float(row[6])
+        except Exception:
+            pass
+
+    # S&P fallback 2: FRED daily S&P500 series (no API key).
+    if spx_price is None:
+        try:
+            fred_response = requests.get(FRED_SPX_CSV_URL, timeout=15)
+            fred_response.raise_for_status()
+            # CSV columns: DATE,SP500
+            rows = [line.strip() for line in fred_response.text.splitlines() if line.strip()]
+            # Walk backwards and take latest non-empty numeric value.
+            for line in reversed(rows[1:]):
+                parts = line.split(",")
+                if len(parts) >= 2 and parts[1] not in {"", "."}:
+                    spx_price = float(parts[1])
+                    break
         except Exception:
             pass
 
