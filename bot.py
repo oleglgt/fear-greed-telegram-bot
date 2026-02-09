@@ -6,6 +6,16 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+REQUEST_HEADERS = {
+    # CNN often blocks non-browser default clients (python-requests).
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+}
 
 
 def get_token() -> str:
@@ -30,7 +40,7 @@ def get_token() -> str:
 
 
 def fetch_fear_and_greed() -> tuple[float, str, str]:
-    response = requests.get(CNN_API_URL, timeout=15)
+    response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS, timeout=15)
     response.raise_for_status()
     data = response.json()
 
