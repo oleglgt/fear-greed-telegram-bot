@@ -7,7 +7,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
-BOT_VERSION = "v1.4.0"
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+BOT_VERSION = "v1.5.0"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -94,6 +95,29 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     return score, rating, updated_at
 
 
+def fetch_market_prices() -> tuple[float, float]:
+    params = {"symbols": "BTC-USD,^GSPC"}
+    response = requests.get(YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    results = data["quoteResponse"]["result"]
+    btc_price = None
+    spx_price = None
+    for item in results:
+        symbol = item.get("symbol")
+        price = item.get("regularMarketPrice")
+        if symbol == "BTC-USD" and price is not None:
+            btc_price = float(price)
+        if symbol == "^GSPC" and price is not None:
+            spx_price = float(price)
+
+    if btc_price is None or spx_price is None:
+        raise ValueError("No BTC/S&P prices in Yahoo response")
+
+    return btc_price, spx_price
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         with_version(
@@ -107,6 +131,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stock_block: str
     crypto_block: str
+    prices_block: str
 
     try:
         score, rating, updated_at = fetch_fear_and_greed()
@@ -128,7 +153,18 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         crypto_block = f"Crypto Fear & Greed: ошибка ({exc})"
 
-    await update.message.reply_text(with_version(f"{stock_block}\n\n{crypto_block}"))
+    try:
+        btc_price, spx_price = fetch_market_prices()
+        prices_block = (
+            f"Bitcoin (BTC-USD): ${btc_price:,.2f}\n"
+            f"S&P 500 (^GSPC): {spx_price:,.2f}"
+        )
+    except Exception as exc:
+        prices_block = f"Рыночные цены: ошибка ({exc})"
+
+    await update.message.reply_text(
+        with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
+    )
 
 
 async def on_startup(app) -> None:
