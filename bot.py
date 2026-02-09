@@ -8,7 +8,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
-BOT_VERSION = "v1.5.0"
+COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
+STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
+BOT_VERSION = "v1.5.1"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -96,24 +98,51 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
 
 
 def fetch_market_prices() -> tuple[float, float]:
-    params = {"symbols": "BTC-USD,^GSPC"}
-    response = requests.get(YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS, timeout=15)
-    response.raise_for_status()
-    data = response.json()
+    # Primary source: Yahoo Finance.
+    try:
+        params = {"symbols": "BTC-USD,^GSPC"}
+        response = requests.get(
+            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS, timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    results = data["quoteResponse"]["result"]
-    btc_price = None
-    spx_price = None
-    for item in results:
-        symbol = item.get("symbol")
-        price = item.get("regularMarketPrice")
-        if symbol == "BTC-USD" and price is not None:
-            btc_price = float(price)
-        if symbol == "^GSPC" and price is not None:
-            spx_price = float(price)
+        results = data["quoteResponse"]["result"]
+        btc_price = None
+        spx_price = None
+        for item in results:
+            symbol = item.get("symbol")
+            price = item.get("regularMarketPrice")
+            if symbol == "BTC-USD" and price is not None:
+                btc_price = float(price)
+            if symbol == "^GSPC" and price is not None:
+                spx_price = float(price)
 
-    if btc_price is None or spx_price is None:
-        raise ValueError("No BTC/S&P prices in Yahoo response")
+        if btc_price is not None and spx_price is not None:
+            return btc_price, spx_price
+    except Exception:
+        pass
+
+    # Fallback sources when Yahoo rate limits (HTTP 429):
+    # - BTC: CoinGecko
+    # - S&P 500: Stooq (^SPX close price)
+    btc_response = requests.get(
+        COINGECKO_BTC_URL,
+        params={"ids": "bitcoin", "vs_currencies": "usd"},
+        timeout=15,
+    )
+    btc_response.raise_for_status()
+    btc_data = btc_response.json()
+    btc_price = float(btc_data["bitcoin"]["usd"])
+
+    spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
+    spx_response.raise_for_status()
+    lines = [line.strip() for line in spx_response.text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError("No S&P data from Stooq")
+    row = lines[1].split(",")
+    # CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
+    spx_price = float(row[6])
 
     return btc_price, spx_price
 
@@ -160,7 +189,7 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"S&P 500 (^GSPC): {spx_price:,.2f}"
         )
     except Exception as exc:
-        prices_block = f"Рыночные цены: ошибка ({exc})"
+        prices_block = f"Рыночные цены: ошибка (источник временно недоступен: {exc})"
 
     await update.message.reply_text(
         with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
