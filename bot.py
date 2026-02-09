@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from telegram import Update
@@ -21,12 +21,21 @@ REQUEST_HEADERS = {
 def parse_timestamp_utc(timestamp_raw: object) -> datetime:
     """
     CNN may return timestamp as int/float/string.
-    Supports unix seconds and unix milliseconds.
+    Supports unix seconds, unix milliseconds and ISO datetime strings.
     """
-    ts = float(str(timestamp_raw).strip())
-    if ts > 1e12:
-        ts = ts / 1000.0
-    return datetime.utcfromtimestamp(ts)
+    raw = str(timestamp_raw).strip()
+    try:
+        ts = float(raw)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return datetime.utcfromtimestamp(ts)
+    except ValueError:
+        # Example: 2026-02-09T20:08:11+00:00 or ...Z
+        iso = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
 
 def get_token() -> str:
