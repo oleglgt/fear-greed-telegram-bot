@@ -7,6 +7,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
+BOT_VERSION = "v1.3.0"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -17,6 +18,10 @@ REQUEST_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://edition.cnn.com/markets/fear-and-greed",
 }
+
+
+def with_version(text: str) -> str:
+    return f"[{BOT_VERSION}]\n{text}"
 
 
 def parse_timestamp_utc(timestamp_raw: object) -> datetime:
@@ -91,10 +96,12 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Я показываю Fear & Greed Index.\n"
-        "Команды:\n"
-        "/fg - stock (CNN)\n"
-        "/crypto или /cfg - crypto"
+        with_version(
+            "Привет! Я показываю Fear & Greed Index.\n"
+            "Команды:\n"
+            "/fg - stock (CNN)\n"
+            "/crypto или /cfg - crypto"
+        )
     )
 
 
@@ -102,24 +109,32 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
         await update.message.reply_text(
-            f"Fear & Greed Index: {score:.2f}\n"
-            f"Состояние: {rating}\n"
-            f"Обновлено: {updated_at}"
+            with_version(
+                f"Fear & Greed Index: {score:.2f}\n"
+                f"Состояние: {rating}\n"
+                f"Обновлено: {updated_at}"
+            )
         )
     except Exception as exc:
-        await update.message.reply_text(f"Не удалось получить данные: {exc}")
+        await update.message.reply_text(
+            with_version(f"Не удалось получить данные: {exc}")
+        )
 
 
 async def crypto_fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         score, rating, updated_at = fetch_crypto_fear_and_greed()
         await update.message.reply_text(
-            f"Crypto Fear & Greed Index: {score}\n"
-            f"Состояние: {rating}\n"
-            f"Обновлено: {updated_at}"
+            with_version(
+                f"Crypto Fear & Greed Index: {score}\n"
+                f"Состояние: {rating}\n"
+                f"Обновлено: {updated_at}"
+            )
         )
     except Exception as exc:
-        await update.message.reply_text(f"Не удалось получить crypto данные: {exc}")
+        await update.message.reply_text(
+            with_version(f"Не удалось получить crypto данные: {exc}")
+        )
 
 
 def main() -> None:
