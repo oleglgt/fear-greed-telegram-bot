@@ -9,8 +9,9 @@ CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
-BOT_VERSION = "v1.5.1"
+BOT_VERSION = "v1.5.2"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -21,6 +22,8 @@ REQUEST_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://edition.cnn.com/markets/fear-and-greed",
 }
+LAST_BTC_PRICE: float | None = None
+LAST_SPX_PRICE: float | None = None
 
 
 def with_version(text: str) -> str:
@@ -98,7 +101,12 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
 
 
 def fetch_market_prices() -> tuple[float, float]:
-    # Primary source: Yahoo Finance.
+    global LAST_BTC_PRICE, LAST_SPX_PRICE
+
+    btc_price: float | None = None
+    spx_price: float | None = None
+
+    # Primary source: Yahoo Finance (both symbols in one call).
     try:
         params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
@@ -108,8 +116,6 @@ def fetch_market_prices() -> tuple[float, float]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
-        btc_price = None
-        spx_price = None
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
@@ -117,32 +123,59 @@ def fetch_market_prices() -> tuple[float, float]:
                 btc_price = float(price)
             if symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
-
-        if btc_price is not None and spx_price is not None:
-            return btc_price, spx_price
     except Exception:
         pass
 
-    # Fallback sources when Yahoo rate limits (HTTP 429):
-    # - BTC: CoinGecko
-    # - S&P 500: Stooq (^SPX close price)
-    btc_response = requests.get(
-        COINGECKO_BTC_URL,
-        params={"ids": "bitcoin", "vs_currencies": "usd"},
-        timeout=15,
-    )
-    btc_response.raise_for_status()
-    btc_data = btc_response.json()
-    btc_price = float(btc_data["bitcoin"]["usd"])
+    # BTC fallback 1: Coinbase spot API.
+    if btc_price is None:
+        try:
+            btc_response = requests.get(
+                COINBASE_BTC_URL, params={"currency": "USD"}, timeout=15
+            )
+            btc_response.raise_for_status()
+            btc_data = btc_response.json()
+            btc_price = float(btc_data["data"]["amount"])
+        except Exception:
+            pass
 
-    spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
-    spx_response.raise_for_status()
-    lines = [line.strip() for line in spx_response.text.splitlines() if line.strip()]
-    if len(lines) < 2:
-        raise ValueError("No S&P data from Stooq")
-    row = lines[1].split(",")
-    # CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
-    spx_price = float(row[6])
+    # BTC fallback 2: CoinGecko.
+    if btc_price is None:
+        try:
+            btc_response = requests.get(
+                COINGECKO_BTC_URL,
+                params={"ids": "bitcoin", "vs_currencies": "usd"},
+                timeout=15,
+            )
+            btc_response.raise_for_status()
+            btc_data = btc_response.json()
+            btc_price = float(btc_data["bitcoin"]["usd"])
+        except Exception:
+            pass
+
+    # S&P fallback: Stooq (^SPX close price from CSV).
+    if spx_price is None:
+        try:
+            spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
+            spx_response.raise_for_status()
+            lines = [line.strip() for line in spx_response.text.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                row = lines[1].split(",")
+                # CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
+                spx_price = float(row[6])
+        except Exception:
+            pass
+
+    # Last-resort fallback: last successful values in memory.
+    if btc_price is None:
+        btc_price = LAST_BTC_PRICE
+    if spx_price is None:
+        spx_price = LAST_SPX_PRICE
+
+    if btc_price is None or spx_price is None:
+        raise ValueError("не удалось получить цены BTC/S&P ни из одного источника")
+
+    LAST_BTC_PRICE = btc_price
+    LAST_SPX_PRICE = spx_price
 
     return btc_price, spx_price
 
@@ -189,7 +222,7 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"S&P 500 (^GSPC): {spx_price:,.2f}"
         )
     except Exception as exc:
-        prices_block = f"Рыночные цены: ошибка (источник временно недоступен: {exc})"
+        prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
     await update.message.reply_text(
         with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
