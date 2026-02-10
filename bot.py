@@ -12,7 +12,7 @@ COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
-BOT_VERSION = "v1.5.3"
+BOT_VERSION = "v1.5.4"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -215,21 +215,13 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         score, rating, updated_at = fetch_fear_and_greed()
-        stock_block = (
-            f"Stock Fear & Greed (CNN): {score:.2f}\n"
-            f"Состояние: {rating}\n"
-            f"Обновлено: {updated_at}"
-        )
+        stock_block = f"Stock Fear & Greed (CNN): {score:.2f} {rating} {updated_at}"
     except Exception as exc:
         stock_block = f"Stock Fear & Greed (CNN): ошибка ({exc})"
 
     try:
         c_score, c_rating, c_updated_at = fetch_crypto_fear_and_greed()
-        crypto_block = (
-            f"Crypto Fear & Greed: {c_score}\n"
-            f"Состояние: {c_rating}\n"
-            f"Обновлено: {c_updated_at}"
-        )
+        crypto_block = f"Crypto Fear & Greed: {c_score} {c_rating} {c_updated_at}"
     except Exception as exc:
         crypto_block = f"Crypto Fear & Greed: ошибка ({exc})"
 
