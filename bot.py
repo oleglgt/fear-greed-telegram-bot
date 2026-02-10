@@ -13,7 +13,8 @@ COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
-BOT_VERSION = "v1.5.4"
+FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
+BOT_VERSION = "v1.5.6"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -43,14 +44,19 @@ def parse_timestamp_utc(timestamp_raw: object) -> datetime:
         ts = float(raw)
         if ts > 1e12:
             ts = ts / 1000.0
-        return datetime.utcfromtimestamp(ts)
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
     except ValueError:
         # Example: 2026-02-09T20:08:11+00:00 or ...Z
         iso = raw.replace("Z", "+00:00")
         dt = datetime.fromisoformat(iso)
         if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
+            return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc)
+
+
+def format_cyprus_time(dt_utc: datetime) -> str:
+    dt_cy = dt_utc.astimezone(CYPRUS_TZ)
+    return f"{dt_cy.day} {dt_cy.strftime('%b %H:%M')}"
 
 
 def get_token() -> str:
@@ -83,7 +89,7 @@ def fetch_fear_and_greed() -> tuple[float, str, str]:
     rating = data["fear_and_greed"]["rating"]
     timestamp_raw = data["fear_and_greed"]["timestamp"]
     dt_utc = parse_timestamp_utc(timestamp_raw)
-    updated_at = dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+    updated_at = format_cyprus_time(dt_utc)
 
     return float(score), str(rating), updated_at
 
@@ -98,7 +104,7 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     rating = str(latest["value_classification"])
     timestamp_raw = latest["timestamp"]
     dt_utc = parse_timestamp_utc(timestamp_raw)
-    updated_at = dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+    updated_at = format_cyprus_time(dt_utc)
 
     return score, rating, updated_at
 
@@ -200,6 +206,30 @@ def fetch_market_prices() -> tuple[float, float]:
     return btc_price, spx_price
 
 
+def fetch_fx_rates() -> tuple[float, float]:
+    """
+    Returns:
+        USD/EUR and RUB/EUR
+    """
+    response = requests.get(
+        FRANKFURTER_LATEST_URL,
+        params={"from": "EUR", "to": "USD,RUB"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    rates = data["rates"]
+
+    eur_usd = float(rates["USD"])
+    eur_rub = float(rates["RUB"])
+    if eur_usd <= 0 or eur_rub <= 0:
+        raise ValueError("invalid FX rates")
+
+    usd_eur = 1.0 / eur_usd
+    rub_eur = 1.0 / eur_rub
+    return usd_eur, rub_eur
+
+
 def build_report_text() -> str:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
@@ -222,7 +252,13 @@ def build_report_text() -> str:
     except Exception as exc:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
-    return with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
+    try:
+        usd_eur, rub_eur = fetch_fx_rates()
+        fx_block = f"USD/EUR: {usd_eur:.5f}\nRUB/EUR: {rub_eur:.5f}"
+    except Exception as exc:
+        fx_block = f"FX курсы: временно недоступны ({exc})"
+
+    return with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}\n\n{fx_block}")
 
 
 def get_target_chat_id() -> int | None:
