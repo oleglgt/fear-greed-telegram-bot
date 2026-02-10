@@ -14,7 +14,8 @@ COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
-BOT_VERSION = "v1.5.6"
+OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
+BOT_VERSION = "v1.5.7"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -211,23 +212,34 @@ def fetch_fx_rates() -> tuple[float, float]:
     Returns:
         USD/EUR and RUB/EUR
     """
-    response = requests.get(
-        FRANKFURTER_LATEST_URL,
-        params={"from": "EUR", "to": "USD,RUB"},
-        timeout=15,
-    )
+    # Primary source.
+    try:
+        response = requests.get(
+            FRANKFURTER_LATEST_URL,
+            params={"from": "EUR", "to": "USD,RUB"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        rates = data["rates"]
+        eur_usd = float(rates["USD"])
+        eur_rub = float(rates["RUB"])
+        if eur_usd > 0 and eur_rub > 0:
+            return 1.0 / eur_usd, 1.0 / eur_rub
+    except Exception:
+        pass
+
+    # Fallback source (often includes RUB when other sources don't).
+    response = requests.get(OPEN_ER_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
     rates = data["rates"]
-
     eur_usd = float(rates["USD"])
     eur_rub = float(rates["RUB"])
     if eur_usd <= 0 or eur_rub <= 0:
         raise ValueError("invalid FX rates")
 
-    usd_eur = 1.0 / eur_usd
-    rub_eur = 1.0 / eur_rub
-    return usd_eur, rub_eur
+    return 1.0 / eur_usd, 1.0 / eur_rub
 
 
 def build_report_text() -> str:
