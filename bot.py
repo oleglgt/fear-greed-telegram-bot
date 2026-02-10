@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from telegram import BotCommand, Update
@@ -25,6 +26,7 @@ REQUEST_HEADERS = {
 }
 LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
+CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 
 
 def with_version(text: str) -> str:
@@ -198,21 +200,7 @@ def fetch_market_prices() -> tuple[float, float]:
     return btc_price, spx_price
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        with_version(
-            "Привет! Я показываю Fear & Greed Index.\n"
-            "Команды:\n"
-            "/fg - stock + crypto в одном сообщении"
-        )
-    )
-
-
-async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    stock_block: str
-    crypto_block: str
-    prices_block: str
-
+def build_report_text() -> str:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
         stock_block = f"Stock Fear & Greed (CNN): {score:.2f} {rating} {updated_at}"
@@ -234,9 +222,42 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
+    return with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
+
+
+def get_target_chat_id() -> int | None:
+    raw = os.getenv("TELEGRAM_TARGET_CHAT_ID", "").strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}")
+        with_version(
+            "Привет! Я показываю Fear & Greed Index.\n"
+            "Команды:\n"
+            "/fg - stock + crypto в одном сообщении\n\n"
+            "Авто-отправка в 08:00 и 20:00 (Кипр) работает, если в Render задана "
+            "переменная TELEGRAM_TARGET_CHAT_ID."
+        )
     )
+
+
+async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(build_report_text())
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    await update.message.reply_text(
+        with_version(f"Твой chat_id: {chat_id}")
+    )
+
+
+async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.data
+    await context.bot.send_message(chat_id=chat_id, text=build_report_text())
 
 
 async def on_startup(app) -> None:
@@ -244,8 +265,23 @@ async def on_startup(app) -> None:
         [
             BotCommand("start", "помощь"),
             BotCommand("fg", "stock + crypto Fear & Greed"),
+            BotCommand("myid", "показать chat_id"),
         ]
     )
+    target_chat_id = get_target_chat_id()
+    if target_chat_id and app.job_queue is not None:
+        app.job_queue.run_daily(
+            scheduled_report,
+            time=time(hour=8, minute=0, tzinfo=CYPRUS_TZ),
+            data=target_chat_id,
+            name="daily_report_0800_cyprus",
+        )
+        app.job_queue.run_daily(
+            scheduled_report,
+            time=time(hour=20, minute=0, tzinfo=CYPRUS_TZ),
+            data=target_chat_id,
+            name="daily_report_2000_cyprus",
+        )
 
 
 def main() -> None:
@@ -254,6 +290,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
+    app.add_handler(CommandHandler("myid", myid))
 
     app.run_polling()
 
