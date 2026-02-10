@@ -250,9 +250,15 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id if update.effective_chat else None
-    await update.message.reply_text(
-        with_version(f"Твой chat_id: {chat_id}")
-    )
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(with_version(f"Твой chat_id: {chat_id}"))
+        return
+    # Fallback for rare update types without effective_message.
+    if chat_id is not None:
+        await context.bot.send_message(
+            chat_id=chat_id, text=with_version(f"Твой chat_id: {chat_id}")
+        )
 
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,6 +272,7 @@ async def on_startup(app) -> None:
             BotCommand("start", "помощь"),
             BotCommand("fg", "stock + crypto Fear & Greed"),
             BotCommand("myid", "показать chat_id"),
+            BotCommand("id", "показать chat_id (alias)"),
         ]
     )
     target_chat_id = get_target_chat_id()
@@ -290,7 +297,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
-    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler(["myid", "id", "chatid"], myid))
 
     app.run_polling()
 
