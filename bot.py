@@ -15,7 +15,7 @@ STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
-BOT_VERSION = "v1.5.7"
+BOT_VERSION = "v1.5.8"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -210,7 +210,7 @@ def fetch_market_prices() -> tuple[float, float]:
 def fetch_fx_rates() -> tuple[float, float]:
     """
     Returns:
-        USD/EUR and RUB/EUR
+        EUR/USD and RUB/USD
     """
     # Primary source.
     try:
@@ -225,7 +225,8 @@ def fetch_fx_rates() -> tuple[float, float]:
         eur_usd = float(rates["USD"])
         eur_rub = float(rates["RUB"])
         if eur_usd > 0 and eur_rub > 0:
-            return 1.0 / eur_usd, 1.0 / eur_rub
+            rub_usd = eur_usd / eur_rub
+            return eur_usd, rub_usd
     except Exception:
         pass
 
@@ -239,7 +240,8 @@ def fetch_fx_rates() -> tuple[float, float]:
     if eur_usd <= 0 or eur_rub <= 0:
         raise ValueError("invalid FX rates")
 
-    return 1.0 / eur_usd, 1.0 / eur_rub
+    rub_usd = eur_usd / eur_rub
+    return eur_usd, rub_usd
 
 
 def build_report_text() -> str:
@@ -265,8 +267,8 @@ def build_report_text() -> str:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
     try:
-        usd_eur, rub_eur = fetch_fx_rates()
-        fx_block = f"USD/EUR: {usd_eur:.5f}\nRUB/EUR: {rub_eur:.5f}"
+        eur_usd, rub_usd = fetch_fx_rates()
+        fx_block = f"EUR/USD: {eur_usd:.5f}\nRUB/USD: {rub_usd:.5f}"
     except Exception as exc:
         fx_block = f"FX курсы: временно недоступны ({exc})"
 
