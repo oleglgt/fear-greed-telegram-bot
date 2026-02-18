@@ -192,15 +192,24 @@ def read_xlsx_first_sheet_rows(xlsx_bytes: bytes) -> dict[int, dict[str, object]
 
 def fetch_cyprus_reservoirs_summary() -> str:
     html = get_url_text(WDD_RESERVOIRS_PAGE_URL)
-    match = re.search(
-        r'href=\"([^\"]*UK\\.xlsx\\?OpenElement)\"',
+
+    # WDD sometimes serves mixed href casing/quoting/URL styles.
+    href_matches = re.findall(
+        r"""href\s*=\s*(['"])(.*?)\1""",
         html,
         flags=re.IGNORECASE,
     )
-    if not match:
+    xlsx_candidates = []
+    for _, href in href_matches:
+        low = href.lower()
+        if ".xlsx" not in low:
+            continue
+        if "uk.xlsx" in low and "graphs" not in low:
+            xlsx_candidates.append(href)
+    if not xlsx_candidates:
         raise ValueError("WDD latest UK.xlsx link not found")
 
-    xlsx_url = urljoin(WDD_RESERVOIRS_PAGE_URL, match.group(1))
+    xlsx_url = urljoin(WDD_RESERVOIRS_PAGE_URL, xlsx_candidates[0])
     report_date = parse_wdd_report_date(xlsx_url)
     xlsx_bytes = get_url_bytes(xlsx_url)
     rows = read_xlsx_first_sheet_rows(xlsx_bytes)
@@ -362,10 +371,11 @@ def fetch_fx_rates() -> tuple[float, float, str]:
         EUR/USD, EUR/RUB and source descriptor
     """
     # Primary source: Yahoo FX (more оперативный intraday feed).
+    # We support both direct EURRUB and synthetic EURUSD * USDRUB paths.
     try:
         response = requests.get(
             YAHOO_QUOTE_URL,
-            params={"symbols": "EURUSD=X,EURRUB=X"},
+            params={"symbols": "EURUSD=X,EURRUB=X,RUB=X,USDRUB=X"},
             headers=REQUEST_HEADERS,
             timeout=15,
         )
@@ -373,7 +383,8 @@ def fetch_fx_rates() -> tuple[float, float, str]:
         data = response.json()
         results = data["quoteResponse"]["result"]
         eur_usd = None
-        eur_rub = None
+        eur_rub_direct = None
+        usd_rub = None
         market_time = None
         for item in results:
             symbol = item.get("symbol")
@@ -382,15 +393,31 @@ def fetch_fx_rates() -> tuple[float, float, str]:
                 eur_usd = float(price)
                 market_time = item.get("regularMarketTime", market_time)
             if symbol == "EURRUB=X" and price is not None:
-                eur_rub = float(price)
+                eur_rub_direct = float(price)
+                market_time = item.get("regularMarketTime", market_time)
+            # Yahoo commonly returns RUB=X as USD/RUB (RUB per 1 USD).
+            if symbol == "RUB=X" and price is not None:
+                usd_rub = float(price)
+                market_time = item.get("regularMarketTime", market_time)
+            if symbol == "USDRUB=X" and price is not None:
+                usd_rub = float(price)
                 market_time = item.get("regularMarketTime", market_time)
 
-        if eur_usd and eur_rub and eur_usd > 0 and eur_rub > 0:
+        if eur_usd and eur_usd > 0:
+            eur_rub = None
             source = "Yahoo FX"
-            if market_time:
-                dt_utc = datetime.fromtimestamp(float(market_time), tz=timezone.utc)
-                source = f"{source}, {format_cyprus_time(dt_utc)}"
-            return eur_usd, eur_rub, source
+            if eur_rub_direct and eur_rub_direct > 0:
+                eur_rub = eur_rub_direct
+                source = "Yahoo FX (direct EURRUB)"
+            elif usd_rub and usd_rub > 0:
+                eur_rub = eur_usd * usd_rub
+                source = "Yahoo FX (EURUSD x USDRUB)"
+
+            if eur_rub and eur_rub > 0:
+                if market_time:
+                    dt_utc = datetime.fromtimestamp(float(market_time), tz=timezone.utc)
+                    source = f"{source}, {format_cyprus_time(dt_utc)}"
+                return eur_usd, eur_rub, source
     except Exception:
         pass
 
