@@ -15,7 +15,7 @@ STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
-BOT_VERSION = "v1.6.0"
+BOT_VERSION = "v1.6.1"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -218,7 +218,40 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     Returns:
         EUR/USD, EUR/RUB and source descriptor
     """
-    # Primary source.
+    # Primary source: Yahoo FX (more оперативный intraday feed).
+    try:
+        response = requests.get(
+            YAHOO_QUOTE_URL,
+            params={"symbols": "EURUSD=X,EURRUB=X"},
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        results = data["quoteResponse"]["result"]
+        eur_usd = None
+        eur_rub = None
+        market_time = None
+        for item in results:
+            symbol = item.get("symbol")
+            price = item.get("regularMarketPrice")
+            if symbol == "EURUSD=X" and price is not None:
+                eur_usd = float(price)
+                market_time = item.get("regularMarketTime", market_time)
+            if symbol == "EURRUB=X" and price is not None:
+                eur_rub = float(price)
+                market_time = item.get("regularMarketTime", market_time)
+
+        if eur_usd and eur_rub and eur_usd > 0 and eur_rub > 0:
+            source = "Yahoo FX"
+            if market_time:
+                dt_utc = datetime.fromtimestamp(float(market_time), tz=timezone.utc)
+                source = f"{source}, {format_cyprus_time(dt_utc)}"
+            return eur_usd, eur_rub, source
+    except Exception:
+        pass
+
+    # Fallback 1: Frankfurter/ECB (reference, usually daily).
     try:
         response = requests.get(
             FRANKFURTER_LATEST_URL,
@@ -245,7 +278,7 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     except Exception:
         pass
 
-    # Fallback source (often includes RUB when other sources don't).
+    # Fallback 2: open.er-api (when other sources don't include RUB).
     response = requests.get(OPEN_ER_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
