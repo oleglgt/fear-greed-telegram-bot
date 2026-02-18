@@ -25,8 +25,8 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.7.1"
-REQUEST_HEADERS = {
+BOT_VERSION = "v1.7.2"
+REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -35,6 +35,14 @@ REQUEST_HEADERS = {
     ),
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+}
+REQUEST_HEADERS_GENERIC = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
 }
 LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
@@ -97,24 +105,26 @@ def get_token() -> str:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment or .env file.")
 
 
-def get_url_text(url: str) -> str:
+def get_url_text(url: str, headers: dict[str, str] | None = None) -> str:
+    req_headers = headers or REQUEST_HEADERS_GENERIC
     try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+        response = requests.get(url, headers=req_headers, timeout=30)
         response.raise_for_status()
         return response.text
     except requests.exceptions.SSLError:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30, verify=False)
+        response = requests.get(url, headers=req_headers, timeout=30, verify=False)
         response.raise_for_status()
         return response.text
 
 
-def get_url_bytes(url: str) -> bytes:
+def get_url_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
+    req_headers = headers or REQUEST_HEADERS_GENERIC
     try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+        response = requests.get(url, headers=req_headers, timeout=30)
         response.raise_for_status()
         return response.content
     except requests.exceptions.SSLError:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30, verify=False)
+        response = requests.get(url, headers=req_headers, timeout=30, verify=False)
         response.raise_for_status()
         return response.content
 
@@ -242,7 +252,7 @@ def fetch_cyprus_reservoirs_summary() -> str:
 
 
 def fetch_fear_and_greed() -> tuple[float, str, str]:
-    response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS, timeout=15)
+    response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS_CNN, timeout=15)
     response.raise_for_status()
     data = response.json()
 
@@ -280,7 +290,7 @@ def fetch_market_prices() -> tuple[float, float]:
     try:
         params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
-            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS, timeout=15
+            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
         )
         response.raise_for_status()
         data = response.json()
@@ -378,7 +388,7 @@ def fetch_fx_rates() -> tuple[float, float, str]:
         response = requests.get(
             YAHOO_QUOTE_URL,
             params={"symbols": "EURUSD=X,EURRUB=X,RUB=X,USDRUB=X"},
-            headers=REQUEST_HEADERS,
+            headers=REQUEST_HEADERS_GENERIC,
             timeout=15,
         )
         response.raise_for_status()
