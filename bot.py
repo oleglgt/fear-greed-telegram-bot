@@ -15,7 +15,7 @@ STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
-BOT_VERSION = "v1.5.9"
+BOT_VERSION = "v1.6.0"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -29,6 +29,7 @@ REQUEST_HEADERS = {
 LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
+SCHEDULER_STATUS = "not-initialized"
 
 
 def with_version(text: str) -> str:
@@ -58,6 +59,11 @@ def parse_timestamp_utc(timestamp_raw: object) -> datetime:
 def format_cyprus_time(dt_utc: datetime) -> str:
     dt_cy = dt_utc.astimezone(CYPRUS_TZ)
     return f"{dt_cy.day} {dt_cy.strftime('%b %H:%M')}"
+
+
+def format_cyprus_date(dt_utc: datetime) -> str:
+    dt_cy = dt_utc.astimezone(CYPRUS_TZ)
+    return f"{dt_cy.day} {dt_cy.strftime('%b')}"
 
 
 def get_token() -> str:
@@ -207,10 +213,10 @@ def fetch_market_prices() -> tuple[float, float]:
     return btc_price, spx_price
 
 
-def fetch_fx_rates() -> tuple[float, float]:
+def fetch_fx_rates() -> tuple[float, float, str]:
     """
     Returns:
-        EUR/USD and EUR/RUB
+        EUR/USD, EUR/RUB and source descriptor
     """
     # Primary source.
     try:
@@ -225,7 +231,17 @@ def fetch_fx_rates() -> tuple[float, float]:
         eur_usd = float(rates["USD"])
         eur_rub = float(rates["RUB"])
         if eur_usd > 0 and eur_rub > 0:
-            return eur_usd, eur_rub
+            date_raw = str(data.get("date", "")).strip()
+            source = "Frankfurter/ECB"
+            if date_raw:
+                try:
+                    dt_utc = datetime.strptime(date_raw, "%Y-%m-%d").replace(
+                        tzinfo=timezone.utc
+                    )
+                    source = f"{source}, {format_cyprus_date(dt_utc)}"
+                except ValueError:
+                    source = f"{source}, {date_raw}"
+            return eur_usd, eur_rub, source
     except Exception:
         pass
 
@@ -239,7 +255,18 @@ def fetch_fx_rates() -> tuple[float, float]:
     if eur_usd <= 0 or eur_rub <= 0:
         raise ValueError("invalid FX rates")
 
-    return eur_usd, eur_rub
+    updated_raw = data.get("time_last_update_utc")
+    source = "open.er-api"
+    if updated_raw:
+        try:
+            dt_utc = datetime.strptime(
+                str(updated_raw), "%a, %d %b %Y %H:%M:%S %z"
+            ).astimezone(timezone.utc)
+            source = f"{source}, {format_cyprus_time(dt_utc)}"
+        except ValueError:
+            source = f"{source}, {updated_raw}"
+
+    return eur_usd, eur_rub, source
 
 
 def build_report_text() -> str:
@@ -265,8 +292,12 @@ def build_report_text() -> str:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
     try:
-        eur_usd, eur_rub = fetch_fx_rates()
-        fx_block = f"EUR/USD: {eur_usd:.5f}\nEUR/RUB: {eur_rub:.5f}"
+        eur_usd, eur_rub, fx_source = fetch_fx_rates()
+        fx_block = (
+            f"EUR/USD: {eur_usd:.5f}\n"
+            f"EUR/RUB: {eur_rub:.5f}\n"
+            f"FX source: {fx_source}"
+        )
     except Exception as exc:
         fx_block = f"FX курсы: временно недоступны ({exc})"
 
@@ -309,34 +340,59 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
+    has_job_queue = "yes" if context.application.job_queue is not None else "no"
+    jobs = context.application.job_queue.jobs() if context.application.job_queue else []
+    job_names = ", ".join(job.name for job in jobs) if jobs else "(none)"
+    await update.effective_message.reply_text(
+        with_version(
+            "Статус бота:\n"
+            f"- Scheduler: {SCHEDULER_STATUS}\n"
+            f"- job_queue available: {has_job_queue}\n"
+            f"- TELEGRAM_TARGET_CHAT_ID: {target_chat_id}\n"
+            f"- jobs: {job_names}"
+        )
+    )
+
+
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
     await context.bot.send_message(chat_id=chat_id, text=build_report_text())
 
 
 async def on_startup(app) -> None:
+    global SCHEDULER_STATUS
     await app.bot.set_my_commands(
         [
             BotCommand("start", "помощь"),
             BotCommand("fg", "stock + crypto Fear & Greed"),
             BotCommand("myid", "показать chat_id"),
             BotCommand("id", "показать chat_id (alias)"),
+            BotCommand("status", "статус scheduler и env"),
         ]
     )
     target_chat_id = get_target_chat_id()
-    if target_chat_id and app.job_queue is not None:
-        app.job_queue.run_daily(
-            scheduled_report,
-            time=time(hour=8, minute=0, tzinfo=CYPRUS_TZ),
-            data=target_chat_id,
-            name="daily_report_0800_cyprus",
-        )
-        app.job_queue.run_daily(
-            scheduled_report,
-            time=time(hour=20, minute=0, tzinfo=CYPRUS_TZ),
-            data=target_chat_id,
-            name="daily_report_2000_cyprus",
-        )
+    if not target_chat_id:
+        SCHEDULER_STATUS = "disabled: TELEGRAM_TARGET_CHAT_ID is not set"
+        return
+    if app.job_queue is None:
+        SCHEDULER_STATUS = "disabled: job_queue unavailable (install ptb[job-queue])"
+        return
+
+    app.job_queue.run_daily(
+        scheduled_report,
+        time=time(hour=8, minute=0, tzinfo=CYPRUS_TZ),
+        data=target_chat_id,
+        name="daily_report_0800_cyprus",
+    )
+    app.job_queue.run_daily(
+        scheduled_report,
+        time=time(hour=20, minute=0, tzinfo=CYPRUS_TZ),
+        data=target_chat_id,
+        name="daily_report_2000_cyprus",
+    )
+    SCHEDULER_STATUS = "enabled: 08:00 and 20:00 Europe/Nicosia"
 
 
 def main() -> None:
@@ -346,6 +402,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
     app.add_handler(CommandHandler(["myid", "id", "chatid"], myid))
+    app.add_handler(CommandHandler("status", status))
 
     app.run_polling()
 
