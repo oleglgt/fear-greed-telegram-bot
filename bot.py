@@ -1,6 +1,11 @@
 import os
+import io
+import re
+import zipfile
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
+import xml.etree.ElementTree as ET
 
 import requests
 from telegram import BotCommand, Update
@@ -15,7 +20,10 @@ STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
-BOT_VERSION = "v1.6.1"
+WDD_RESERVOIRS_PAGE_URL = (
+    "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
+)
+BOT_VERSION = "v1.7.0"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -85,6 +93,141 @@ def get_token() -> str:
                         return cleaned
 
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment or .env file.")
+
+
+def get_url_text(url: str) -> str:
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.SSLError:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30, verify=False)
+        response.raise_for_status()
+        return response.text
+
+
+def get_url_bytes(url: str) -> bytes:
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+        response.raise_for_status()
+        return response.content
+    except requests.exceptions.SSLError:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=30, verify=False)
+        response.raise_for_status()
+        return response.content
+
+
+def col_from_ref(cell_ref: str) -> str:
+    return "".join(ch for ch in cell_ref if ch.isalpha())
+
+
+def parse_wdd_report_date(text: str) -> str:
+    # Usually in URL/file name: 18-FEB-2026
+    match = re.search(r"(\\d{1,2})-([A-Z]{3})-(\\d{4})", text)
+    if not match:
+        return "n/a"
+    day, mon, year = match.groups()
+    dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y").replace(
+        tzinfo=timezone.utc
+    )
+    return f"{dt.day} {dt.strftime('%b %Y')}"
+
+
+def read_xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    strings: list[str] = []
+    for si in root.findall(f"{ns}si"):
+        parts = [t.text or "" for t in si.iter(f"{ns}t")]
+        strings.append("".join(parts))
+    return strings
+
+
+def read_xlsx_first_sheet_rows(xlsx_bytes: bytes) -> dict[int, dict[str, object]]:
+    ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    ns_rel = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
+        shared = read_xlsx_shared_strings(zf)
+        workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
+        first_sheet = workbook.find(f"{ns_main}sheets/{ns_main}sheet")
+        if first_sheet is None:
+            raise ValueError("No worksheet in WDD xlsx")
+        rel_id = first_sheet.attrib[f"{ns_rel}id"]
+        sheet_target = rel_map[rel_id]
+        sheet_xml = ET.fromstring(zf.read(f"xl/{sheet_target}"))
+
+        rows_data: dict[int, dict[str, object]] = {}
+        for row in sheet_xml.findall(f".//{ns_main}row"):
+            row_num = int(row.attrib["r"])
+            values: dict[str, object] = {}
+            for cell in row.findall(f"{ns_main}c"):
+                ref = cell.attrib.get("r")
+                if not ref:
+                    continue
+                col = col_from_ref(ref)
+                cell_type = cell.attrib.get("t")
+                value_node = cell.find(f"{ns_main}v")
+                inline_node = cell.find(f"{ns_main}is")
+                if value_node is not None and value_node.text is not None:
+                    raw = value_node.text
+                    if cell_type == "s":
+                        values[col] = shared[int(raw)]
+                    else:
+                        try:
+                            values[col] = float(raw)
+                        except ValueError:
+                            values[col] = raw
+                elif inline_node is not None:
+                    text_node = inline_node.find(f".//{ns_main}t")
+                    if text_node is not None and text_node.text is not None:
+                        values[col] = text_node.text
+            if values:
+                rows_data[row_num] = values
+        return rows_data
+
+
+def fetch_cyprus_reservoirs_summary() -> str:
+    html = get_url_text(WDD_RESERVOIRS_PAGE_URL)
+    match = re.search(
+        r'href=\"([^\"]*UK\\.xlsx\\?OpenElement)\"',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError("WDD latest UK.xlsx link not found")
+
+    xlsx_url = urljoin(WDD_RESERVOIRS_PAGE_URL, match.group(1))
+    report_date = parse_wdd_report_date(xlsx_url)
+    xlsx_bytes = get_url_bytes(xlsx_url)
+    rows = read_xlsx_first_sheet_rows(xlsx_bytes)
+
+    grand_total_row = None
+    for row_num, row_values in rows.items():
+        if str(row_values.get("B", "")).strip() == "GRAND TOTAL":
+            grand_total_row = row_values
+            break
+    if grand_total_row is None:
+        raise ValueError("GRAND TOTAL row not found in WDD xlsx")
+
+    since_from = str(rows.get(15, {}).get("G", "n/a"))
+    inflow_24h = float(grand_total_row["F"])
+    inflow_since = float(grand_total_row["G"])
+    current_mcm = float(grand_total_row["H"])
+    current_pct = float(grand_total_row["I"])
+    last_year_mcm = float(grand_total_row["J"])
+    last_year_pct = float(grand_total_row["K"])
+
+    return (
+        "Cyprus reservoirs:\n"
+        f"Inflow: +{inflow_24h:.3f} MCM (24h), +{inflow_since:.3f} MCM (since {since_from})\n"
+        f"Now: {current_mcm:.3f} MCM ({current_pct:.2f}%)\n"
+        f"Last year: {last_year_mcm:.3f} MCM ({last_year_pct:.2f}%)\n"
+        f"Report date: {report_date}"
+    )
 
 
 def fetch_fear_and_greed() -> tuple[float, str, str]:
@@ -334,7 +477,14 @@ def build_report_text() -> str:
     except Exception as exc:
         fx_block = f"FX курсы: временно недоступны ({exc})"
 
-    return with_version(f"{stock_block}\n\n{crypto_block}\n\n{prices_block}\n\n{fx_block}")
+    try:
+        reservoirs_block = fetch_cyprus_reservoirs_summary()
+    except Exception as exc:
+        reservoirs_block = f"Cyprus reservoirs: временно недоступно ({exc})"
+
+    return with_version(
+        f"{stock_block}\n\n{crypto_block}\n\n{prices_block}\n\n{fx_block}\n\n{reservoirs_block}"
+    )
 
 
 def get_target_chat_id() -> int | None:
