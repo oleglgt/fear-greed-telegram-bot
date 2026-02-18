@@ -20,10 +20,12 @@ STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
+STOOQ_EURUSD_CSV_URL = "https://stooq.com/q/l/?s=eurusd&i=1"
+STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.7.0"
+BOT_VERSION = "v1.7.1"
 REQUEST_HEADERS = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -122,12 +124,12 @@ def col_from_ref(cell_ref: str) -> str:
 
 
 def parse_wdd_report_date(text: str) -> str:
-    # Usually in URL/file name: 18-FEB-2026
-    match = re.search(r"(\\d{1,2})-([A-Z]{3})-(\\d{4})", text)
+    # Usually in URL/file name: 18-FEB-2026 (or with spaces/underscores)
+    match = re.search(r"(\d{1,2})[-_ ]([A-Z]{3})[-_ ](\d{4})", text, flags=re.I)
     if not match:
         return "n/a"
     day, mon, year = match.groups()
-    dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y").replace(
+    dt = datetime.strptime(f"{day} {mon.upper()} {year}", "%d %b %Y").replace(
         tzinfo=timezone.utc
     )
     return f"{dt.day} {dt.strftime('%b %Y')}"
@@ -421,7 +423,32 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     except Exception:
         pass
 
-    # Fallback 1: Frankfurter/ECB (reference, usually daily).
+    # Fallback 1: Stooq intraday CSV feed.
+    try:
+        eurusd_csv = get_url_text(STOOQ_EURUSD_CSV_URL).strip().splitlines()
+        eurrub_csv = get_url_text(STOOQ_EURRUB_CSV_URL).strip().splitlines()
+        if len(eurusd_csv) >= 2 and len(eurrub_csv) >= 2:
+            eurusd_parts = eurusd_csv[1].split(",")
+            eurrub_parts = eurrub_csv[1].split(",")
+            # CSV format: Symbol,Date,Time,Open,High,Low,Close,Volume,...
+            eur_usd = float(eurusd_parts[6])
+            eur_rub = float(eurrub_parts[6])
+            if eur_usd > 0 and eur_rub > 0:
+                date_raw = eurusd_parts[1] if len(eurusd_parts) > 1 else ""
+                time_raw = eurusd_parts[2] if len(eurusd_parts) > 2 else ""
+                source = "Stooq"
+                if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
+                    dt_label = (
+                        f"{int(date_raw[6:8])} "
+                        f"{datetime.strptime(date_raw[4:6], '%m').strftime('%b')} "
+                        f"{time_raw[:2]}:{time_raw[2:4]}"
+                    )
+                    source = f"{source}, {dt_label}"
+                return eur_usd, eur_rub, source
+    except Exception:
+        pass
+
+    # Fallback 2: Frankfurter/ECB (reference, usually daily).
     try:
         response = requests.get(
             FRANKFURTER_LATEST_URL,
@@ -448,7 +475,7 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     except Exception:
         pass
 
-    # Fallback 2: open.er-api (when other sources don't include RUB).
+    # Fallback 3: open.er-api (when other sources don't include RUB).
     response = requests.get(OPEN_ER_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
