@@ -1,6 +1,8 @@
 import os
 import io
+import json
 import re
+import time as time_module
 import zipfile
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
@@ -31,7 +33,7 @@ NEWS_RSS_SOURCES = [
     "https://feeds.reuters.com/Reuters/worldNews",
     "https://www.cnbc.com/id/100727362/device/rss/rss.html",
 ]
-BOT_VERSION = "v1.10.2"
+BOT_VERSION = "v1.10.3"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -54,6 +56,7 @@ LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
+NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": ""}
 
 
 def with_version(text: str) -> str:
@@ -586,115 +589,113 @@ def fetch_news_items(limit: int = 8) -> list[dict[str, str]]:
     return items
 
 
-def summarize_news_with_ai(items: list[dict[str, str]]) -> str:
+def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set")
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "temperature": temperature,
+        "messages": messages,
+    }
 
+    for attempt in range(3):
+        response = requests.post(
+            OPENAI_CHAT_COMPLETIONS_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=45,
+        )
+        if response.status_code == 429:
+            retry_after_raw = response.headers.get("Retry-After", "").strip()
+            try:
+                retry_after = float(retry_after_raw) if retry_after_raw else 0.0
+            except ValueError:
+                retry_after = 0.0
+            if attempt < 2:
+                wait_seconds = max(retry_after, 2.0 * (attempt + 1))
+                time_module.sleep(wait_seconds)
+                continue
+            raise ValueError(f"OpenAI 429: {response.text[:220]}")
+
+        if not response.ok:
+            raise ValueError(f"OpenAI {response.status_code}: {response.text[:220]}")
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    raise ValueError("OpenAI request failed after retries")
+
+
+def generate_news_digest_with_ai(items: list[dict[str, str]]) -> tuple[str, list[str]]:
     user_lines = []
-    for idx, item in enumerate(items, start=1):
+    for idx, item in enumerate(items[:8], start=1):
         user_lines.append(
             f"{idx}. {item['title']} | {item.get('pub_date','')} | {item.get('link','')}"
         )
     user_payload = "\n".join(user_lines)
 
-    payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "temperature": 0.2,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You create concise market/news digests in Russian. "
-                    "Return 4-6 short bullets only, prioritize macro/markets relevance, "
-                    "no markdown headers."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Сделай краткий дайджест новостей из списка ниже:\n"
-                    f"{user_payload}"
-                ),
-            },
-        ],
-    }
-    response = requests.post(
-        OPENAI_CHAT_COMPLETIONS_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты делаешь сжатый новостной дайджест на русском для рынка. "
+                "Верни СТРОГО JSON-объект без markdown: "
+                '{"summary_bullets":["..."],"translated_titles":["..."]}. '
+                "summary_bullets: 4-6 пунктов, translated_titles: 5 заголовков."
+            ),
         },
-        json=payload,
-        timeout=45,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
-
-
-def translate_news_titles_with_ai(items: list[dict[str, str]], max_items: int = 5) -> list[str]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not set")
-
-    selected = items[:max_items]
-    user_lines = []
-    for idx, item in enumerate(selected, start=1):
-        user_lines.append(f"{idx}. {item['title']}")
-    user_payload = "\n".join(user_lines)
-
-    payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Переведи заголовки новостей на русский. "
-                    "Сохрани нумерацию и выдай строго по одной строке на заголовок."
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_payload,
-            },
-        ],
-    }
-    response = requests.post(
-        OPENAI_CHAT_COMPLETIONS_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+        {
+            "role": "user",
+            "content": f"Новости:\n{user_payload}",
         },
-        json=payload,
-        timeout=45,
-    )
-    response.raise_for_status()
-    data = response.json()
-    text = data["choices"][0]["message"]["content"].strip()
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    cleaned = [re.sub(r"^\\d+[\\).:-]?\\s*", "", line).strip() for line in lines]
-    return cleaned[:max_items]
+    ]
+    text = call_openai_chat(messages, temperature=0.2).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", text)
+        text = re.sub(r"\\n?```$", "", text).strip()
+    parsed = json.loads(text)
+    bullets = parsed.get("summary_bullets", [])
+    titles = parsed.get("translated_titles", [])
+    if not isinstance(bullets, list) or not isinstance(titles, list):
+        raise ValueError("AI JSON format invalid")
+    summary = "\n".join(f"- {normalize_text(str(b))}" for b in bullets[:6] if str(b).strip())
+    translated = [normalize_text(str(t)) for t in titles[:5] if str(t).strip()]
+    if not summary:
+        raise ValueError("AI summary is empty")
+    return summary, translated
 
 
 def build_news_block() -> str:
+    ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "900"))
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if NEWS_CACHE.get("content") and float(NEWS_CACHE.get("expires_at", 0.0)) > now_ts:
+        return str(NEWS_CACHE["content"])
+
     items = fetch_news_items(limit=8)
     if not items:
         return "News: источники временно недоступны."
 
     try:
-        summary = summarize_news_with_ai(items)
-        translated_titles = translate_news_titles_with_ai(items, max_items=5)
+        summary, translated_titles = generate_news_digest_with_ai(items)
         lines = ["News digest:", summary, "", "Заголовки (RU):"]
         for title in translated_titles:
             lines.append(f"- {title}")
-        return "\n".join(lines)
+        content = "\n".join(lines)
+        NEWS_CACHE["content"] = content
+        NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+        return content
     except Exception as exc:
         lines = [f"News AI: fallback ({exc})", "", "News digest (raw):"]
         for item in items[:5]:
             lines.append(f"- {item['title']}")
-        return "\n".join(lines)
+        content = "\n".join(lines)
+        NEWS_CACHE["content"] = content
+        NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+        return content
 
 
 def build_fear_greed_block() -> str:
