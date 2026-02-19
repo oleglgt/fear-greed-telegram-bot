@@ -31,7 +31,7 @@ NEWS_RSS_SOURCES = [
     "https://feeds.reuters.com/Reuters/worldNews",
     "https://www.cnbc.com/id/100727362/device/rss/rss.html",
 ]
-BOT_VERSION = "v1.10.0"
+BOT_VERSION = "v1.10.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -633,6 +633,51 @@ def summarize_news_with_ai(items: list[dict[str, str]]) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+def translate_news_titles_with_ai(items: list[dict[str, str]], max_items: int = 5) -> list[str]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    selected = items[:max_items]
+    user_lines = []
+    for idx, item in enumerate(selected, start=1):
+        user_lines.append(f"{idx}. {item['title']}")
+    user_payload = "\n".join(user_lines)
+
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Переведи заголовки новостей на русский. "
+                    "Сохрани нумерацию и выдай строго по одной строке на заголовок."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_payload,
+            },
+        ],
+    }
+    response = requests.post(
+        OPENAI_CHAT_COMPLETIONS_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=45,
+    )
+    response.raise_for_status()
+    data = response.json()
+    text = data["choices"][0]["message"]["content"].strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    cleaned = [re.sub(r"^\\d+[\\).:-]?\\s*", "", line).strip() for line in lines]
+    return cleaned[:max_items]
+
+
 def build_news_block() -> str:
     items = fetch_news_items(limit=8)
     if not items:
@@ -640,7 +685,11 @@ def build_news_block() -> str:
 
     try:
         summary = summarize_news_with_ai(items)
-        return f"News digest:\n{summary}"
+        translated_titles = translate_news_titles_with_ai(items, max_items=5)
+        lines = ["News digest:", summary, "", "Заголовки (RU):"]
+        for title in translated_titles:
+            lines.append(f"- {title}")
+        return "\n".join(lines)
     except Exception:
         lines = ["News digest (raw):"]
         for item in items[:5]:
