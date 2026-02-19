@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.1"
+BOT_VERSION = "v1.11.2"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -592,6 +592,45 @@ def news_item_fingerprint(item: dict[str, str]) -> str:
     return f"{source}|{title}"
 
 
+def normalize_category(value: str) -> str:
+    raw = normalize_text(value).lower()
+    if raw in {"politics", "political", "geopolitics", "world", "government"}:
+        return "politics"
+    if raw in {"technology", "tech", "ai", "science", "startup", "startups"}:
+        return "technology"
+    if raw in {"markets", "market", "finance", "business", "economy", "economics"}:
+        return "markets"
+    return raw or "news"
+
+
+def parse_ai_news_items(text: str) -> list[dict[str, str]]:
+    payload = text.strip()
+    if payload.startswith("```"):
+        payload = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", payload)
+        payload = re.sub(r"\\n?```$", "", payload).strip()
+    parsed = json.loads(payload)
+    items = parsed.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError("AI JSON format invalid")
+
+    out: list[dict[str, str]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "category": normalize_category(str(raw.get("category", ""))),
+            "headline_en": normalize_text(str(raw.get("headline_en", ""))),
+            "headline_ru": normalize_text(str(raw.get("headline_ru", ""))),
+            "source": normalize_text(str(raw.get("source", ""))),
+            "published_at": normalize_text(str(raw.get("published_at", ""))),
+            "details_en": normalize_text(str(raw.get("details_en", ""))),
+            "url": normalize_text(str(raw.get("url", ""))),
+        }
+        if item["headline_en"] and item["details_en"] and item["url"]:
+            out.append(item)
+    return out
+
+
 def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -634,56 +673,57 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
 
 
 def fetch_news_items_via_ai() -> list[dict[str, str]]:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a reliable news research assistant. "
-                "Find only non-Russian news from the last 24 hours. "
-                "Return STRICT JSON, no markdown, with schema: "
-                '{"items":[{"category":"politics|technology|markets","headline_en":"",'
-                '"headline_ru":"", "source":"", "published_at":"", "details_en":"", "url":""}]}. '
-                "Need exactly: 5 politics + 10 technology + 10 markets items. "
-                "headline_ru must be short Russian translation of headline_en. "
-                "details_en must be one concise English paragraph."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Find in the last 24 hours 5 top news on politics, "
-                "10 on technology, and 10 on markets. "
-                "Format this as a short headline (with source and time), "
-                "then a paragraph with details and a link to the original source."
-            ),
-        },
-    ]
-    text = call_openai_chat(messages, temperature=0.2).strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", text)
-        text = re.sub(r"\\n?```$", "", text).strip()
-    parsed = json.loads(text)
-    items = parsed.get("items", [])
-    if not isinstance(items, list):
-        raise ValueError("AI JSON format invalid")
-    out: list[dict[str, str]] = []
-    for raw in items:
-        if not isinstance(raw, dict):
-            continue
-        item = {
-            "category": normalize_text(str(raw.get("category", ""))).lower(),
-            "headline_en": normalize_text(str(raw.get("headline_en", ""))),
-            "headline_ru": normalize_text(str(raw.get("headline_ru", ""))),
-            "source": normalize_text(str(raw.get("source", ""))),
-            "published_at": normalize_text(str(raw.get("published_at", ""))),
-            "details_en": normalize_text(str(raw.get("details_en", ""))),
-            "url": normalize_text(str(raw.get("url", ""))),
-        }
-        if item["headline_en"] and item["details_en"] and item["url"]:
-            out.append(item)
-    if not out:
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    targets: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
+    final_items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for category, count in targets:
+        collected: list[dict[str, str]] = []
+        for _ in range(2):
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a reliable news research assistant. "
+                        "Find only non-Russian news from the last 24 hours. "
+                        f"Current UTC time is {now_utc}. "
+                        "Return STRICT JSON (no markdown) with schema: "
+                        '{"items":[{"category":"","headline_en":"","headline_ru":"",'
+                        '"source":"","published_at":"","details_en":"","url":""}]}. '
+                        "Use ISO format for published_at when possible (example: 2026-02-19T14:05:00Z). "
+                        "headline_ru must be short Russian translation of headline_en. "
+                        "details_en must be one concise English paragraph."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Return exactly {count} top {category} news items from the last 24 hours. "
+                        f"Set category to '{category}' for every item. "
+                        "Each item must include source, published_at, details_en, and original url."
+                    ),
+                },
+            ]
+            text = call_openai_chat(messages, temperature=0.1)
+            parsed_items = parse_ai_news_items(text)
+
+            for item in parsed_items:
+                fp = news_item_fingerprint(item)
+                if fp in seen:
+                    continue
+                item["category"] = category
+                collected.append(item)
+                seen.add(fp)
+                if len(collected) >= count:
+                    break
+            if len(collected) >= count:
+                break
+        final_items.extend(collected[:count])
+
+    if not final_items:
         raise ValueError("AI returned no valid news items")
-    return out
+    return final_items
 
 
 def build_news_block(force_refresh: bool = False) -> str:
