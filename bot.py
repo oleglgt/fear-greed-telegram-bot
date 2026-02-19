@@ -28,12 +28,9 @@ WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
-NEWS_RSS_SOURCES = [
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://feeds.reuters.com/Reuters/worldNews",
-    "https://www.cnbc.com/id/100727362/device/rss/rss.html",
-]
-BOT_VERSION = "v1.10.4"
+NEWS_HISTORY_FILE = "news_history.json"
+NEWS_HISTORY_HOURS = 72
+BOT_VERSION = "v1.11.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -557,36 +554,42 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     return fetch_fx_open_er()
 
 
-def fetch_news_items(limit: int = 8) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for source_url in NEWS_RSS_SOURCES:
-        try:
-            xml_text = get_url_text(source_url)
-            root = ET.fromstring(xml_text)
-            for node in root.findall(".//item"):
-                title = normalize_text(node.findtext("title", ""))
-                link = (node.findtext("link", "") or "").strip()
-                pub_date = normalize_text(node.findtext("pubDate", ""))
-                if not title:
+def load_news_history() -> dict[str, float]:
+    try:
+        with open(NEWS_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out: dict[str, float] = {}
+            for key, value in data.items():
+                try:
+                    out[str(key)] = float(value)
+                except (TypeError, ValueError):
                     continue
-                key = (link or title).lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "pub_date": pub_date,
-                        "source": source_url,
-                    }
-                )
-                if len(items) >= limit:
-                    return items
-        except Exception:
-            continue
-    return items
+            return out
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_news_history(history: dict[str, float]) -> None:
+    with open(NEWS_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False)
+
+
+def prune_news_history(history: dict[str, float], now_ts: float) -> dict[str, float]:
+    cutoff = now_ts - (NEWS_HISTORY_HOURS * 3600)
+    return {k: ts for k, ts in history.items() if ts >= cutoff}
+
+
+def news_item_fingerprint(item: dict[str, str]) -> str:
+    url = normalize_text(item.get("url", ""))
+    if url:
+        return url.lower()
+    source = normalize_text(item.get("source", "")).lower()
+    title = normalize_text(item.get("headline_en", "")).lower()
+    return f"{source}|{title}"
 
 
 def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -> str:
@@ -630,27 +633,29 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
     raise ValueError("OpenAI request failed after retries")
 
 
-def generate_news_digest_with_ai(items: list[dict[str, str]]) -> tuple[str, list[str]]:
-    user_lines = []
-    for idx, item in enumerate(items[:8], start=1):
-        user_lines.append(
-            f"{idx}. {item['title']} | {item.get('pub_date','')} | {item.get('link','')}"
-        )
-    user_payload = "\n".join(user_lines)
-
+def fetch_news_items_via_ai() -> list[dict[str, str]]:
     messages = [
         {
             "role": "system",
             "content": (
-                "Ты делаешь сжатый новостной дайджест на русском для рынка. "
-                "Верни СТРОГО JSON-объект без markdown: "
-                '{"summary_bullets":["..."],"translated_titles":["..."]}. '
-                "summary_bullets: 4-6 пунктов, translated_titles: 5 заголовков."
+                "You are a reliable news research assistant. "
+                "Find only non-Russian news from the last 24 hours. "
+                "Return STRICT JSON, no markdown, with schema: "
+                '{"items":[{"category":"politics|technology|markets","headline_en":"",'
+                '"headline_ru":"", "source":"", "published_at":"", "details_en":"", "url":""}]}. '
+                "Need exactly: 5 politics + 10 technology + 10 markets items. "
+                "headline_ru must be short Russian translation of headline_en. "
+                "details_en must be one concise English paragraph."
             ),
         },
         {
             "role": "user",
-            "content": f"Новости:\n{user_payload}",
+            "content": (
+                "Find in the last 24 hours 5 top news on politics, "
+                "10 on technology, and 10 on markets. "
+                "Format this as a short headline (with source and time), "
+                "then a paragraph with details and a link to the original source."
+            ),
         },
     ]
     text = call_openai_chat(messages, temperature=0.2).strip()
@@ -658,15 +663,27 @@ def generate_news_digest_with_ai(items: list[dict[str, str]]) -> tuple[str, list
         text = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", text)
         text = re.sub(r"\\n?```$", "", text).strip()
     parsed = json.loads(text)
-    bullets = parsed.get("summary_bullets", [])
-    titles = parsed.get("translated_titles", [])
-    if not isinstance(bullets, list) or not isinstance(titles, list):
+    items = parsed.get("items", [])
+    if not isinstance(items, list):
         raise ValueError("AI JSON format invalid")
-    summary = "\n".join(f"- {normalize_text(str(b))}" for b in bullets[:6] if str(b).strip())
-    translated = [normalize_text(str(t)) for t in titles[:5] if str(t).strip()]
-    if not summary:
-        raise ValueError("AI summary is empty")
-    return summary, translated
+    out: list[dict[str, str]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "category": normalize_text(str(raw.get("category", ""))).lower(),
+            "headline_en": normalize_text(str(raw.get("headline_en", ""))),
+            "headline_ru": normalize_text(str(raw.get("headline_ru", ""))),
+            "source": normalize_text(str(raw.get("source", ""))),
+            "published_at": normalize_text(str(raw.get("published_at", ""))),
+            "details_en": normalize_text(str(raw.get("details_en", ""))),
+            "url": normalize_text(str(raw.get("url", ""))),
+        }
+        if item["headline_en"] and item["details_en"] and item["url"]:
+            out.append(item)
+    if not out:
+        raise ValueError("AI returned no valid news items")
+    return out
 
 
 def build_news_block(force_refresh: bool = False) -> str:
@@ -680,15 +697,42 @@ def build_news_block(force_refresh: bool = False) -> str:
     ):
         return str(NEWS_CACHE["content"])
 
-    items = fetch_news_items(limit=8)
-    if not items:
-        return "News: источники временно недоступны."
-
     try:
-        summary, translated_titles = generate_news_digest_with_ai(items)
-        lines = ["News digest:", summary, "", "Заголовки (RU):"]
-        for title in translated_titles:
-            lines.append(f"- {title}")
+        ai_items = fetch_news_items_via_ai()
+        history = prune_news_history(load_news_history(), now_ts)
+        fresh_items: list[dict[str, str]] = []
+        for item in ai_items:
+            fp = news_item_fingerprint(item)
+            if fp in history:
+                continue
+            fresh_items.append(item)
+
+        if not fresh_items:
+            content = (
+                "News digest:\n"
+                "Новых новостей за последние 72 часа (по истории бота) не найдено.\n\n"
+                f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
+            )
+            NEWS_CACHE["content"] = content
+            NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+            NEWS_CACHE["updated_at"] = now_ts
+            return content
+
+        lines = ["News digest:"]
+        for item in fresh_items[:25]:
+            cat = item.get("category", "news").capitalize()
+            lines.append(
+                f"- [{cat}] {item['headline_ru']} ({item['source']}, {item['published_at']})"
+            )
+            lines.append(item["details_en"])
+            lines.append(item["url"])
+            lines.append("")
+
+        # Persist shown items for 72h dedup.
+        for item in fresh_items:
+            history[news_item_fingerprint(item)] = now_ts
+        save_news_history(prune_news_history(history, now_ts))
+
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
@@ -697,9 +741,7 @@ def build_news_block(force_refresh: bool = False) -> str:
         NEWS_CACHE["updated_at"] = now_ts
         return content
     except Exception as exc:
-        lines = [f"News AI: fallback ({exc})", "", "News digest (raw):"]
-        for item in items[:5]:
-            lines.append(f"- {item['title']}")
+        lines = [f"News AI: fallback ({exc})"]
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
