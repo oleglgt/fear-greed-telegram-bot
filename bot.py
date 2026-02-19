@@ -25,7 +25,7 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.8.2"
+BOT_VERSION = "v1.9.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -540,7 +540,7 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     return fetch_fx_open_er()
 
 
-def build_report_text() -> str:
+def build_fear_greed_block() -> str:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
         stock_block = f"Stock Fear & Greed (CNN): {score:.2f} {rating} {updated_at}"
@@ -562,24 +562,33 @@ def build_report_text() -> str:
     except Exception as exc:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
+    return f"{stock_block}\n\n{crypto_block}\n\n{prices_block}"
+
+
+def build_fx_block() -> str:
     try:
         eur_usd, eur_rub, fx_source = fetch_fx_rates()
-        fx_block = (
+        return (
             f"EUR/USD: {eur_usd:.5f}\n"
             f"EUR/RUB: {eur_rub:.5f}\n"
             f"FX source: {fx_source}"
         )
     except Exception as exc:
-        fx_block = f"FX курсы: временно недоступны ({exc})"
+        return f"FX курсы: временно недоступны ({exc})"
 
+
+def build_dam_block() -> str:
     try:
-        reservoirs_block = fetch_cyprus_reservoirs_summary()
+        return fetch_cyprus_reservoirs_summary()
     except Exception as exc:
-        reservoirs_block = f"Cyprus reservoirs: временно недоступно ({exc})"
+        return f"Cyprus reservoirs: временно недоступно ({exc})"
 
-    return with_version(
-        f"{stock_block}\n\n{crypto_block}\n\n{prices_block}\n\n{fx_block}\n\n{reservoirs_block}"
-    )
+
+def build_all_report_text() -> str:
+    fg_block = build_fear_greed_block()
+    fx_block = build_fx_block()
+    dam_block = build_dam_block()
+    return with_version(f"{fg_block}\n\n{fx_block}\n\n{dam_block}")
 
 
 def get_target_chat_id() -> int | None:
@@ -594,15 +603,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with_version(
             "Привет! Я показываю Fear & Greed Index.\n"
             "Команды:\n"
-            "/fg - stock + crypto в одном сообщении\n\n"
-            "Авто-отправка в 08:00 и 20:00 (Кипр) работает, если в Render задана "
+            "/fg - Fear & Greed блок\n"
+            "/fx - валюты\n"
+            "/dam - Cyprus reservoirs\n"
+            "/all - все блоки\n\n"
+            "Авто-отправка в 08:00 и 20:00 (Кипр) отправляет /all, если в Render задана "
             "переменная TELEGRAM_TARGET_CHAT_ID."
         )
     )
 
 
 async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(build_report_text())
+    await update.message.reply_text(with_version(build_fear_greed_block()))
+
+
+async def fx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(with_version(build_fx_block()))
+
+
+async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(with_version(build_dam_block()))
+
+
+async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(build_all_report_text())
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -636,7 +660,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    await context.bot.send_message(chat_id=chat_id, text=build_report_text())
+    await context.bot.send_message(chat_id=chat_id, text=build_all_report_text())
 
 
 async def on_startup(app) -> None:
@@ -644,7 +668,10 @@ async def on_startup(app) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "помощь"),
-            BotCommand("fg", "stock + crypto Fear & Greed"),
+            BotCommand("fg", "Fear & Greed блок"),
+            BotCommand("fx", "валюты"),
+            BotCommand("dam", "Cyprus reservoirs"),
+            BotCommand("all", "все блоки"),
             BotCommand("myid", "показать chat_id"),
             BotCommand("id", "показать chat_id (alias)"),
             BotCommand("status", "статус scheduler и env"),
@@ -679,6 +706,9 @@ def main() -> None:
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
+    app.add_handler(CommandHandler("fx", fx))
+    app.add_handler(CommandHandler("dam", dam))
+    app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler(["myid", "id", "chatid"], myid))
     app.add_handler(CommandHandler("status", status))
 
