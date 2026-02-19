@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.3"
+BOT_VERSION = "v1.11.4"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -635,8 +635,8 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set")
-    timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
-    max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+    timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "40"))
+    max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
     max_attempts = max(1, min(max_attempts, 5))
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -645,15 +645,29 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
     }
 
     for attempt in range(max_attempts):
-        response = requests.post(
-            OPENAI_CHAT_COMPLETIONS_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout_seconds,
-        )
+        try:
+            response = requests.post(
+                OPENAI_CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout_seconds,
+            )
+        except requests.exceptions.Timeout as exc:
+            if attempt < (max_attempts - 1):
+                time_module.sleep(1.5 * (attempt + 1))
+                continue
+            raise ValueError(
+                f"OpenAI timeout after {max_attempts} attempts ({timeout_seconds}s each): {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            if attempt < (max_attempts - 1):
+                time_module.sleep(1.5 * (attempt + 1))
+                continue
+            raise ValueError(f"OpenAI request error: {exc}") from exc
+
         if response.status_code == 429:
             retry_after_raw = response.headers.get("Retry-After", "").strip()
             try:
