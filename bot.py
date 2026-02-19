@@ -25,7 +25,13 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.9.1"
+OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+NEWS_RSS_SOURCES = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.reuters.com/Reuters/worldNews",
+    "https://www.cnbc.com/id/100727362/device/rss/rss.html",
+]
+BOT_VERSION = "v1.10.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -165,6 +171,14 @@ def get_url_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
         response = requests.get(url, headers=req_headers, timeout=30, verify=False)
         response.raise_for_status()
         return response.content
+
+
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\\s+", " ", strip_html(text)).strip()
 
 
 def col_from_ref(cell_ref: str) -> str:
@@ -540,6 +554,100 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     return fetch_fx_open_er()
 
 
+def fetch_news_items(limit: int = 8) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source_url in NEWS_RSS_SOURCES:
+        try:
+            xml_text = get_url_text(source_url)
+            root = ET.fromstring(xml_text)
+            for node in root.findall(".//item"):
+                title = normalize_text(node.findtext("title", ""))
+                link = (node.findtext("link", "") or "").strip()
+                pub_date = normalize_text(node.findtext("pubDate", ""))
+                if not title:
+                    continue
+                key = (link or title).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "pub_date": pub_date,
+                        "source": source_url,
+                    }
+                )
+                if len(items) >= limit:
+                    return items
+        except Exception:
+            continue
+    return items
+
+
+def summarize_news_with_ai(items: list[dict[str, str]]) -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    user_lines = []
+    for idx, item in enumerate(items, start=1):
+        user_lines.append(
+            f"{idx}. {item['title']} | {item.get('pub_date','')} | {item.get('link','')}"
+        )
+    user_payload = "\n".join(user_lines)
+
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You create concise market/news digests in Russian. "
+                    "Return 4-6 short bullets only, prioritize macro/markets relevance, "
+                    "no markdown headers."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Сделай краткий дайджест новостей из списка ниже:\n"
+                    f"{user_payload}"
+                ),
+            },
+        ],
+    }
+    response = requests.post(
+        OPENAI_CHAT_COMPLETIONS_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=45,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def build_news_block() -> str:
+    items = fetch_news_items(limit=8)
+    if not items:
+        return "News: источники временно недоступны."
+
+    try:
+        summary = summarize_news_with_ai(items)
+        return f"News digest:\n{summary}"
+    except Exception:
+        lines = ["News digest (raw):"]
+        for item in items[:5]:
+            lines.append(f"- {item['title']}")
+        return "\n".join(lines)
+
+
 def build_fear_greed_block() -> str:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
@@ -591,7 +699,10 @@ def build_all_report_text() -> str:
     st_block = build_st_block()
     fx_block = build_fx_block()
     dam_block = build_dam_block()
-    return with_version(f"{fg_block}\n\n{st_block}\n\n{fx_block}\n\n{dam_block}")
+    news_block = build_news_block()
+    return with_version(
+        f"{fg_block}\n\n{st_block}\n\n{fx_block}\n\n{dam_block}\n\n{news_block}"
+    )
 
 
 def get_target_chat_id() -> int | None:
@@ -610,6 +721,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/st - Bitcoin и S&P\n"
             "/fx - валюты\n"
             "/dam - Cyprus reservoirs\n"
+            "/news - новостной дайджест\n"
             "/all - все блоки\n\n"
             "Авто-отправка в 08:00 и 20:00 (Кипр) отправляет /all, если в Render задана "
             "переменная TELEGRAM_TARGET_CHAT_ID."
@@ -631,6 +743,10 @@ async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(with_version(build_dam_block()))
+
+
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(with_version(build_news_block()))
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -667,6 +783,7 @@ async def on_startup(app) -> None:
             BotCommand("st", "Bitcoin и S&P"),
             BotCommand("fx", "валюты"),
             BotCommand("dam", "Cyprus reservoirs"),
+            BotCommand("news", "новостной дайджест"),
             BotCommand("all", "все блоки"),
             BotCommand("status", "статус scheduler и env"),
         ]
@@ -703,6 +820,7 @@ def main() -> None:
     app.add_handler(CommandHandler("st", st))
     app.add_handler(CommandHandler("fx", fx))
     app.add_handler(CommandHandler("dam", dam))
+    app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler("status", status))
 
