@@ -637,19 +637,6 @@ async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(build_all_report_text())
 
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(with_version(f"Твой chat_id: {chat_id}"))
-        return
-    # Fallback for rare update types without effective_message.
-    if chat_id is not None:
-        await context.bot.send_message(
-            chat_id=chat_id, text=with_version(f"Твой chat_id: {chat_id}")
-        )
-
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
@@ -681,8 +668,6 @@ async def on_startup(app) -> None:
             BotCommand("fx", "валюты"),
             BotCommand("dam", "Cyprus reservoirs"),
             BotCommand("all", "все блоки"),
-            BotCommand("myid", "показать chat_id"),
-            BotCommand("id", "показать chat_id (alias)"),
             BotCommand("status", "статус scheduler и env"),
         ]
     )
@@ -719,7 +704,6 @@ def main() -> None:
     app.add_handler(CommandHandler("fx", fx))
     app.add_handler(CommandHandler("dam", dam))
     app.add_handler(CommandHandler("all", all_report))
-    app.add_handler(CommandHandler(["myid", "id", "chatid"], myid))
     app.add_handler(CommandHandler("status", status))
 
     app.run_polling()
