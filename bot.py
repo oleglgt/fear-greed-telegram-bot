@@ -25,7 +25,7 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.8.1"
+BOT_VERSION = "v1.8.2"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -520,6 +520,26 @@ def fetch_fx_open_er() -> tuple[float, float, str]:
     return eur_usd, eur_rub, source
 
 
+def fetch_fx_rates() -> tuple[float, float, str]:
+    """
+    Compact production mode for /fg:
+    Stooq first (best current reliability), then fallbacks.
+    """
+    try:
+        return fetch_fx_stooq()
+    except Exception:
+        pass
+    try:
+        return fetch_fx_yahoo()
+    except Exception:
+        pass
+    try:
+        return fetch_fx_frankfurter()
+    except Exception:
+        pass
+    return fetch_fx_open_er()
+
+
 def build_report_text() -> str:
     try:
         score, rating, updated_at = fetch_fear_and_greed()
@@ -542,22 +562,15 @@ def build_report_text() -> str:
     except Exception as exc:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
-    fx_lines = ["FX (all sources):"]
-    fx_sources = [
-        ("Yahoo", fetch_fx_yahoo),
-        ("Stooq", fetch_fx_stooq),
-        ("Frankfurter", fetch_fx_frankfurter),
-        ("open.er-api", fetch_fx_open_er),
-    ]
-    for label, fetcher in fx_sources:
-        try:
-            eur_usd, eur_rub, fx_source = fetcher()
-            fx_lines.append(
-                f"{label}: EUR/USD {eur_usd:.5f}, EUR/RUB {eur_rub:.5f} | {fx_source}"
-            )
-        except Exception as exc:
-            fx_lines.append(f"{label}: n/a ({exc})")
-    fx_block = "\n".join(fx_lines)
+    try:
+        eur_usd, eur_rub, fx_source = fetch_fx_rates()
+        fx_block = (
+            f"EUR/USD: {eur_usd:.5f}\n"
+            f"EUR/RUB: {eur_rub:.5f}\n"
+            f"FX source: {fx_source}"
+        )
+    except Exception as exc:
+        fx_block = f"FX курсы: временно недоступны ({exc})"
 
     try:
         reservoirs_block = fetch_cyprus_reservoirs_summary()
