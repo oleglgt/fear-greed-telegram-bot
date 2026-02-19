@@ -33,7 +33,7 @@ NEWS_RSS_SOURCES = [
     "https://feeds.reuters.com/Reuters/worldNews",
     "https://www.cnbc.com/id/100727362/device/rss/rss.html",
 ]
-BOT_VERSION = "v1.10.3"
+BOT_VERSION = "v1.10.4"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -56,7 +56,7 @@ LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
-NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": ""}
+NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
 
 
 def with_version(text: str) -> str:
@@ -669,10 +669,15 @@ def generate_news_digest_with_ai(items: list[dict[str, str]]) -> tuple[str, list
     return summary, translated
 
 
-def build_news_block() -> str:
-    ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "900"))
+def build_news_block(force_refresh: bool = False) -> str:
+    ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
+    fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
     now_ts = datetime.now(timezone.utc).timestamp()
-    if NEWS_CACHE.get("content") and float(NEWS_CACHE.get("expires_at", 0.0)) > now_ts:
+    if (
+        not force_refresh
+        and NEWS_CACHE.get("content")
+        and float(NEWS_CACHE.get("expires_at", 0.0)) > now_ts
+    ):
         return str(NEWS_CACHE["content"])
 
     items = fetch_news_items(limit=8)
@@ -684,17 +689,23 @@ def build_news_block() -> str:
         lines = ["News digest:", summary, "", "Заголовки (RU):"]
         for title in translated_titles:
             lines.append(f"- {title}")
+        lines.append("")
+        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
         NEWS_CACHE["content"] = content
         NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+        NEWS_CACHE["updated_at"] = now_ts
         return content
     except Exception as exc:
         lines = [f"News AI: fallback ({exc})", "", "News digest (raw):"]
         for item in items[:5]:
             lines.append(f"- {item['title']}")
+        lines.append("")
+        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
         NEWS_CACHE["content"] = content
-        NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+        NEWS_CACHE["expires_at"] = now_ts + max(fallback_ttl, 30)
+        NEWS_CACHE["updated_at"] = now_ts
         return content
 
 
@@ -796,7 +807,11 @@ async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(with_version(build_news_block()))
+    force_refresh = False
+    if context.args:
+        first = context.args[0].strip().lower()
+        force_refresh = first in {"refresh", "r", "now", "new"}
+    await update.message.reply_text(with_version(build_news_block(force_refresh=force_refresh)))
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
