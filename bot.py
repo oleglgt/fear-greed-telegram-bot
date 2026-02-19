@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.4"
+BOT_VERSION = "v1.11.5"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -54,6 +54,12 @@ LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
+
+
+class NewsFetchError(Exception):
+    def __init__(self, message: str, debug_logs: list[str] | None = None):
+        super().__init__(message)
+        self.debug_logs = debug_logs or []
 
 
 def with_version(text: str) -> str:
@@ -631,7 +637,11 @@ def parse_ai_news_items(text: str) -> list[dict[str, str]]:
     return out
 
 
-def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -> str:
+def call_openai_chat(
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    stage_label: str = "request",
+) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set")
@@ -660,13 +670,14 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
                 time_module.sleep(1.5 * (attempt + 1))
                 continue
             raise ValueError(
-                f"OpenAI timeout after {max_attempts} attempts ({timeout_seconds}s each): {exc}"
+                f"OpenAI timeout at {stage_label} after {max_attempts} attempts "
+                f"({timeout_seconds}s each): {exc}"
             ) from exc
         except requests.exceptions.RequestException as exc:
             if attempt < (max_attempts - 1):
                 time_module.sleep(1.5 * (attempt + 1))
                 continue
-            raise ValueError(f"OpenAI request error: {exc}") from exc
+            raise ValueError(f"OpenAI request error at {stage_label}: {exc}") from exc
 
         if response.status_code == 429:
             retry_after_raw = response.headers.get("Retry-After", "").strip()
@@ -678,10 +689,12 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
                 wait_seconds = max(retry_after, 2.0 * (attempt + 1))
                 time_module.sleep(wait_seconds)
                 continue
-            raise ValueError(f"OpenAI 429: {response.text[:220]}")
+            raise ValueError(f"OpenAI 429 at {stage_label}: {response.text[:220]}")
 
         if not response.ok:
-            raise ValueError(f"OpenAI {response.status_code}: {response.text[:220]}")
+            raise ValueError(
+                f"OpenAI {response.status_code} at {stage_label}: {response.text[:220]}"
+            )
 
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
@@ -689,11 +702,15 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
     raise ValueError("OpenAI request failed after retries")
 
 
-def fetch_news_items_via_ai() -> list[dict[str, str]]:
+def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, str]], list[str]]:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     targets: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
     by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in targets}
     seen: set[str] = set()
+    debug_logs: list[str] = []
+    if debug_mode:
+        debug_logs.append(f"UTC now: {now_utc}")
+        debug_logs.append("Cache: miss (forced live fetch)")
 
     # Fast path: one combined request first.
     combined_messages = [
@@ -721,23 +738,42 @@ def fetch_news_items_via_ai() -> list[dict[str, str]]:
             ),
         },
     ]
-    combined_text = call_openai_chat(combined_messages, temperature=0.1)
-    for item in parse_ai_news_items(combined_text):
-        cat = normalize_category(item.get("category", ""))
-        if cat not in by_category:
-            continue
-        fp = news_item_fingerprint(item)
-        if fp in seen:
-            continue
-        if len(by_category[cat]) < dict(targets)[cat]:
-            by_category[cat].append(item)
-            seen.add(fp)
+    if debug_mode:
+        debug_logs.append("Step: combined request started")
+    try:
+        combined_text = call_openai_chat(
+            combined_messages,
+            temperature=0.1,
+            stage_label="combined request",
+        )
+        parsed_combined = parse_ai_news_items(combined_text)
+        for item in parsed_combined:
+            cat = normalize_category(item.get("category", ""))
+            if cat not in by_category:
+                continue
+            fp = news_item_fingerprint(item)
+            if fp in seen:
+                continue
+            if len(by_category[cat]) < dict(targets)[cat]:
+                by_category[cat].append(item)
+                seen.add(fp)
+        if debug_mode:
+            debug_logs.append(
+                "Step: combined request done "
+                f"(p={len(by_category['politics'])}, "
+                f"t={len(by_category['technology'])}, "
+                f"m={len(by_category['markets'])})"
+            )
+    except Exception as exc:
+        raise NewsFetchError(f"Combined stage failed: {exc}", debug_logs) from exc
 
     # Top-up only missing categories, one request per missing category.
     for category, count in targets:
         missing = count - len(by_category[category])
         if missing <= 0:
             continue
+        if debug_mode:
+            debug_logs.append(f"Step: top-up {category} started (missing={missing})")
         messages = [
             {
                 "role": "system",
@@ -762,27 +798,49 @@ def fetch_news_items_via_ai() -> list[dict[str, str]]:
                 ),
             },
         ]
-        text = call_openai_chat(messages, temperature=0.1)
-        for item in parse_ai_news_items(text):
-            fp = news_item_fingerprint(item)
-            if fp in seen:
-                continue
-            item["category"] = category
-            by_category[category].append(item)
-            seen.add(fp)
-            if len(by_category[category]) >= count:
-                break
+        try:
+            text = call_openai_chat(
+                messages,
+                temperature=0.1,
+                stage_label=f"top-up {category}",
+            )
+            for item in parse_ai_news_items(text):
+                fp = news_item_fingerprint(item)
+                if fp in seen:
+                    continue
+                item["category"] = category
+                by_category[category].append(item)
+                seen.add(fp)
+                if len(by_category[category]) >= count:
+                    break
+            if debug_mode:
+                debug_logs.append(
+                    f"Step: top-up {category} done (have={len(by_category[category])}/{count})"
+                )
+        except Exception as exc:
+            raise NewsFetchError(
+                f"Top-up stage failed for {category}: {exc}",
+                debug_logs,
+            ) from exc
 
     final_items: list[dict[str, str]] = []
     for category, count in targets:
         final_items.extend(by_category[category][:count])
+    if debug_mode:
+        debug_logs.append(
+            "Final items: "
+            f"p={len(by_category['politics'])}, "
+            f"t={len(by_category['technology'])}, "
+            f"m={len(by_category['markets'])}, "
+            f"total={len(final_items)}"
+        )
 
     if not final_items:
-        raise ValueError("AI returned no valid news items")
-    return final_items
+        raise NewsFetchError("AI returned no valid news items", debug_logs)
+    return final_items, debug_logs
 
 
-def build_news_block(force_refresh: bool = False) -> str:
+def build_news_block(force_refresh: bool = False, debug_mode: bool = False) -> str:
     ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
     fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -791,11 +849,21 @@ def build_news_block(force_refresh: bool = False) -> str:
         and NEWS_CACHE.get("content")
         and float(NEWS_CACHE.get("expires_at", 0.0)) > now_ts
     ):
-        return str(NEWS_CACHE["content"])
+        cached = str(NEWS_CACHE["content"])
+        if debug_mode:
+            return f"News service (debug):\n- Cache: hit\n\n{cached}"
+        return cached
 
     try:
-        ai_items = fetch_news_items_via_ai()
-        lines = ["News digest:"]
+        ai_items, debug_logs = fetch_news_items_via_ai(debug_mode=debug_mode)
+        if debug_mode:
+            lines = ["News service (debug):"]
+            for log in debug_logs:
+                lines.append(f"- {log}")
+            lines.append("")
+            lines.append("News digest:")
+        else:
+            lines = ["News digest:"]
         for item in ai_items[:25]:
             cat = item.get("category", "news").capitalize()
             lines.append(
@@ -810,6 +878,20 @@ def build_news_block(force_refresh: bool = False) -> str:
         content = "\n".join(lines)
         NEWS_CACHE["content"] = content
         NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
+        NEWS_CACHE["updated_at"] = now_ts
+        return content
+    except NewsFetchError as exc:
+        lines = [f"News AI: fallback ({exc})"]
+        if debug_mode and exc.debug_logs:
+            lines.append("")
+            lines.append("News service (debug):")
+            for log in exc.debug_logs:
+                lines.append(f"- {log}")
+        lines.append("")
+        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
+        content = "\n".join(lines)
+        NEWS_CACHE["content"] = content
+        NEWS_CACHE["expires_at"] = now_ts + max(fallback_ttl, 30)
         NEWS_CACHE["updated_at"] = now_ts
         return content
     except Exception as exc:
@@ -922,10 +1004,16 @@ async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     force_refresh = False
+    debug_mode = False
     if context.args:
         first = context.args[0].strip().lower()
         force_refresh = first in {"refresh", "r", "now", "new"}
-    await update.message.reply_text(with_version(build_news_block(force_refresh=force_refresh)))
+        debug_mode = first in {"debug", "dbg", "trace"}
+    if debug_mode:
+        force_refresh = True
+    await update.message.reply_text(
+        with_version(build_news_block(force_refresh=force_refresh, debug_mode=debug_mode))
+    )
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
