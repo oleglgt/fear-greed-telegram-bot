@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.6"
+BOT_VERSION = "v1.11.7"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -705,7 +705,7 @@ def call_openai_chat(
 
 def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, str]], list[str]]:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    targets: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
+    targets: list[tuple[str, int]] = [("politics", 1), ("technology", 2), ("markets", 2)]
     by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in targets}
     seen: set[str] = set()
     debug_logs: list[str] = []
@@ -733,8 +733,8 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
         {
             "role": "user",
             "content": (
-                "Return exactly 25 items total from last 24 hours: "
-                "5 politics, 10 technology, 10 markets. "
+                "Return exactly 5 items total from last 24 hours: "
+                "1 politics, 2 technology, 2 markets. "
                 "Each item must include source, published_at, details_en, and original url."
             ),
         },
