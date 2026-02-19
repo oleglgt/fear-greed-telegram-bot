@@ -25,7 +25,7 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.8.0"
+BOT_VERSION = "v1.8.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -82,6 +82,44 @@ def format_cyprus_time(dt_utc: datetime) -> str:
 def format_cyprus_date(dt_utc: datetime) -> str:
     dt_cy = dt_utc.astimezone(CYPRUS_TZ)
     return f"{dt_cy.day} {dt_cy.strftime('%b')}"
+
+
+def parse_stooq_csv_line(csv_text: str) -> tuple[float, str]:
+    """
+    Parse Stooq CSV text and return (close_price, source_label).
+    Supports payloads with or without a header row.
+    """
+    lines = [line.strip() for line in csv_text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("stooq empty response")
+
+    data_line = None
+    for line in lines:
+        if line.lower().startswith("symbol,"):
+            continue
+        data_line = line
+        break
+    if data_line is None:
+        raise ValueError("stooq rows missing")
+
+    parts = [p.strip() for p in data_line.split(",")]
+    if len(parts) < 7:
+        raise ValueError("stooq row malformed")
+    close_raw = parts[6]
+    if close_raw in {"", "N/D"}:
+        raise ValueError("stooq close missing")
+
+    price = float(close_raw)
+    date_raw = parts[1] if len(parts) > 1 else ""
+    time_raw = parts[2] if len(parts) > 2 else ""
+    source = "Stooq"
+    if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
+        source = (
+            f"{source}, {int(date_raw[6:8])} "
+            f"{datetime.strptime(date_raw[4:6], '%m').strftime('%b')} "
+            f"{time_raw[:2]}:{time_raw[2:4]}"
+        )
+    return price, source
 
 
 def get_token() -> str:
@@ -425,26 +463,12 @@ def fetch_fx_yahoo() -> tuple[float, float, str]:
 
 
 def fetch_fx_stooq() -> tuple[float, float, str]:
-    eurusd_csv = get_url_text(STOOQ_EURUSD_CSV_URL).strip().splitlines()
-    eurrub_csv = get_url_text(STOOQ_EURRUB_CSV_URL).strip().splitlines()
-    if len(eurusd_csv) < 2 or len(eurrub_csv) < 2:
-        raise ValueError("stooq rows missing")
-    eurusd_parts = eurusd_csv[1].split(",")
-    eurrub_parts = eurrub_csv[1].split(",")
-    eur_usd = float(eurusd_parts[6])
-    eur_rub = float(eurrub_parts[6])
+    eur_usd, source_usd = parse_stooq_csv_line(get_url_text(STOOQ_EURUSD_CSV_URL))
+    eur_rub, source_rub = parse_stooq_csv_line(get_url_text(STOOQ_EURRUB_CSV_URL))
     if eur_usd <= 0 or eur_rub <= 0:
         raise ValueError("invalid stooq values")
-    date_raw = eurusd_parts[1] if len(eurusd_parts) > 1 else ""
-    time_raw = eurusd_parts[2] if len(eurusd_parts) > 2 else ""
-    source = "Stooq"
-    if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
-        dt_label = (
-            f"{int(date_raw[6:8])} "
-            f"{datetime.strptime(date_raw[4:6], '%m').strftime('%b')} "
-            f"{time_raw[:2]}:{time_raw[2:4]}"
-        )
-        source = f"{source}, {dt_label}"
+    # Prefer RUB timestamp for source label, fallback to EURUSD.
+    source = source_rub if source_rub.startswith("Stooq,") else source_usd
     return eur_usd, eur_rub, source
 
 
@@ -458,6 +482,8 @@ def fetch_fx_frankfurter() -> tuple[float, float, str]:
     data = response.json()
     rates = data["rates"]
     eur_usd = float(rates["USD"])
+    if "RUB" not in rates:
+        raise ValueError("RUB not provided by Frankfurter")
     eur_rub = float(rates["RUB"])
     if eur_usd <= 0 or eur_rub <= 0:
         raise ValueError("invalid frankfurter values")
