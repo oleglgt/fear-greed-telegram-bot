@@ -25,7 +25,7 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.7.2"
+BOT_VERSION = "v1.8.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -377,115 +377,102 @@ def fetch_market_prices() -> tuple[float, float]:
     return btc_price, spx_price
 
 
-def fetch_fx_rates() -> tuple[float, float, str]:
-    """
-    Returns:
-        EUR/USD, EUR/RUB and source descriptor
-    """
-    # Primary source: Yahoo FX (more оперативный intraday feed).
-    # We support both direct EURRUB and synthetic EURUSD * USDRUB paths.
-    try:
-        response = requests.get(
-            YAHOO_QUOTE_URL,
-            params={"symbols": "EURUSD=X,EURRUB=X,RUB=X,USDRUB=X"},
-            headers=REQUEST_HEADERS_GENERIC,
-            timeout=15,
+def fetch_fx_yahoo() -> tuple[float, float, str]:
+    response = requests.get(
+        YAHOO_QUOTE_URL,
+        params={"symbols": "EURUSD=X,EURRUB=X,RUB=X,USDRUB=X"},
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    results = data["quoteResponse"]["result"]
+    eur_usd = None
+    eur_rub_direct = None
+    usd_rub = None
+    market_time = None
+    for item in results:
+        symbol = item.get("symbol")
+        price = item.get("regularMarketPrice")
+        if symbol == "EURUSD=X" and price is not None:
+            eur_usd = float(price)
+            market_time = item.get("regularMarketTime", market_time)
+        if symbol == "EURRUB=X" and price is not None:
+            eur_rub_direct = float(price)
+            market_time = item.get("regularMarketTime", market_time)
+        if symbol == "RUB=X" and price is not None:
+            usd_rub = float(price)
+            market_time = item.get("regularMarketTime", market_time)
+        if symbol == "USDRUB=X" and price is not None:
+            usd_rub = float(price)
+            market_time = item.get("regularMarketTime", market_time)
+
+    if not eur_usd or eur_usd <= 0:
+        raise ValueError("EURUSD not available")
+    if eur_rub_direct and eur_rub_direct > 0:
+        eur_rub = eur_rub_direct
+        source = "Yahoo FX (direct EURRUB)"
+    elif usd_rub and usd_rub > 0:
+        eur_rub = eur_usd * usd_rub
+        source = "Yahoo FX (EURUSD x USDRUB)"
+    else:
+        raise ValueError("EURRUB and USDRUB not available")
+
+    if market_time:
+        dt_utc = datetime.fromtimestamp(float(market_time), tz=timezone.utc)
+        source = f"{source}, {format_cyprus_time(dt_utc)}"
+    return eur_usd, eur_rub, source
+
+
+def fetch_fx_stooq() -> tuple[float, float, str]:
+    eurusd_csv = get_url_text(STOOQ_EURUSD_CSV_URL).strip().splitlines()
+    eurrub_csv = get_url_text(STOOQ_EURRUB_CSV_URL).strip().splitlines()
+    if len(eurusd_csv) < 2 or len(eurrub_csv) < 2:
+        raise ValueError("stooq rows missing")
+    eurusd_parts = eurusd_csv[1].split(",")
+    eurrub_parts = eurrub_csv[1].split(",")
+    eur_usd = float(eurusd_parts[6])
+    eur_rub = float(eurrub_parts[6])
+    if eur_usd <= 0 or eur_rub <= 0:
+        raise ValueError("invalid stooq values")
+    date_raw = eurusd_parts[1] if len(eurusd_parts) > 1 else ""
+    time_raw = eurusd_parts[2] if len(eurusd_parts) > 2 else ""
+    source = "Stooq"
+    if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
+        dt_label = (
+            f"{int(date_raw[6:8])} "
+            f"{datetime.strptime(date_raw[4:6], '%m').strftime('%b')} "
+            f"{time_raw[:2]}:{time_raw[2:4]}"
         )
-        response.raise_for_status()
-        data = response.json()
-        results = data["quoteResponse"]["result"]
-        eur_usd = None
-        eur_rub_direct = None
-        usd_rub = None
-        market_time = None
-        for item in results:
-            symbol = item.get("symbol")
-            price = item.get("regularMarketPrice")
-            if symbol == "EURUSD=X" and price is not None:
-                eur_usd = float(price)
-                market_time = item.get("regularMarketTime", market_time)
-            if symbol == "EURRUB=X" and price is not None:
-                eur_rub_direct = float(price)
-                market_time = item.get("regularMarketTime", market_time)
-            # Yahoo commonly returns RUB=X as USD/RUB (RUB per 1 USD).
-            if symbol == "RUB=X" and price is not None:
-                usd_rub = float(price)
-                market_time = item.get("regularMarketTime", market_time)
-            if symbol == "USDRUB=X" and price is not None:
-                usd_rub = float(price)
-                market_time = item.get("regularMarketTime", market_time)
+        source = f"{source}, {dt_label}"
+    return eur_usd, eur_rub, source
 
-        if eur_usd and eur_usd > 0:
-            eur_rub = None
-            source = "Yahoo FX"
-            if eur_rub_direct and eur_rub_direct > 0:
-                eur_rub = eur_rub_direct
-                source = "Yahoo FX (direct EURRUB)"
-            elif usd_rub and usd_rub > 0:
-                eur_rub = eur_usd * usd_rub
-                source = "Yahoo FX (EURUSD x USDRUB)"
 
-            if eur_rub and eur_rub > 0:
-                if market_time:
-                    dt_utc = datetime.fromtimestamp(float(market_time), tz=timezone.utc)
-                    source = f"{source}, {format_cyprus_time(dt_utc)}"
-                return eur_usd, eur_rub, source
-    except Exception:
-        pass
+def fetch_fx_frankfurter() -> tuple[float, float, str]:
+    response = requests.get(
+        FRANKFURTER_LATEST_URL,
+        params={"from": "EUR", "to": "USD,RUB"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    rates = data["rates"]
+    eur_usd = float(rates["USD"])
+    eur_rub = float(rates["RUB"])
+    if eur_usd <= 0 or eur_rub <= 0:
+        raise ValueError("invalid frankfurter values")
+    date_raw = str(data.get("date", "")).strip()
+    source = "Frankfurter/ECB"
+    if date_raw:
+        try:
+            dt_utc = datetime.strptime(date_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            source = f"{source}, {format_cyprus_date(dt_utc)}"
+        except ValueError:
+            source = f"{source}, {date_raw}"
+    return eur_usd, eur_rub, source
 
-    # Fallback 1: Stooq intraday CSV feed.
-    try:
-        eurusd_csv = get_url_text(STOOQ_EURUSD_CSV_URL).strip().splitlines()
-        eurrub_csv = get_url_text(STOOQ_EURRUB_CSV_URL).strip().splitlines()
-        if len(eurusd_csv) >= 2 and len(eurrub_csv) >= 2:
-            eurusd_parts = eurusd_csv[1].split(",")
-            eurrub_parts = eurrub_csv[1].split(",")
-            # CSV format: Symbol,Date,Time,Open,High,Low,Close,Volume,...
-            eur_usd = float(eurusd_parts[6])
-            eur_rub = float(eurrub_parts[6])
-            if eur_usd > 0 and eur_rub > 0:
-                date_raw = eurusd_parts[1] if len(eurusd_parts) > 1 else ""
-                time_raw = eurusd_parts[2] if len(eurusd_parts) > 2 else ""
-                source = "Stooq"
-                if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
-                    dt_label = (
-                        f"{int(date_raw[6:8])} "
-                        f"{datetime.strptime(date_raw[4:6], '%m').strftime('%b')} "
-                        f"{time_raw[:2]}:{time_raw[2:4]}"
-                    )
-                    source = f"{source}, {dt_label}"
-                return eur_usd, eur_rub, source
-    except Exception:
-        pass
 
-    # Fallback 2: Frankfurter/ECB (reference, usually daily).
-    try:
-        response = requests.get(
-            FRANKFURTER_LATEST_URL,
-            params={"from": "EUR", "to": "USD,RUB"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-        rates = data["rates"]
-        eur_usd = float(rates["USD"])
-        eur_rub = float(rates["RUB"])
-        if eur_usd > 0 and eur_rub > 0:
-            date_raw = str(data.get("date", "")).strip()
-            source = "Frankfurter/ECB"
-            if date_raw:
-                try:
-                    dt_utc = datetime.strptime(date_raw, "%Y-%m-%d").replace(
-                        tzinfo=timezone.utc
-                    )
-                    source = f"{source}, {format_cyprus_date(dt_utc)}"
-                except ValueError:
-                    source = f"{source}, {date_raw}"
-            return eur_usd, eur_rub, source
-    except Exception:
-        pass
-
-    # Fallback 3: open.er-api (when other sources don't include RUB).
+def fetch_fx_open_er() -> tuple[float, float, str]:
     response = requests.get(OPEN_ER_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
@@ -493,8 +480,7 @@ def fetch_fx_rates() -> tuple[float, float, str]:
     eur_usd = float(rates["USD"])
     eur_rub = float(rates["RUB"])
     if eur_usd <= 0 or eur_rub <= 0:
-        raise ValueError("invalid FX rates")
-
+        raise ValueError("invalid open.er-api values")
     updated_raw = data.get("time_last_update_utc")
     source = "open.er-api"
     if updated_raw:
@@ -505,7 +491,6 @@ def fetch_fx_rates() -> tuple[float, float, str]:
             source = f"{source}, {format_cyprus_time(dt_utc)}"
         except ValueError:
             source = f"{source}, {updated_raw}"
-
     return eur_usd, eur_rub, source
 
 
@@ -531,15 +516,22 @@ def build_report_text() -> str:
     except Exception as exc:
         prices_block = f"Рыночные цены: временно недоступны ({exc})"
 
-    try:
-        eur_usd, eur_rub, fx_source = fetch_fx_rates()
-        fx_block = (
-            f"EUR/USD: {eur_usd:.5f}\n"
-            f"EUR/RUB: {eur_rub:.5f}\n"
-            f"FX source: {fx_source}"
-        )
-    except Exception as exc:
-        fx_block = f"FX курсы: временно недоступны ({exc})"
+    fx_lines = ["FX (all sources):"]
+    fx_sources = [
+        ("Yahoo", fetch_fx_yahoo),
+        ("Stooq", fetch_fx_stooq),
+        ("Frankfurter", fetch_fx_frankfurter),
+        ("open.er-api", fetch_fx_open_er),
+    ]
+    for label, fetcher in fx_sources:
+        try:
+            eur_usd, eur_rub, fx_source = fetcher()
+            fx_lines.append(
+                f"{label}: EUR/USD {eur_usd:.5f}, EUR/RUB {eur_rub:.5f} | {fx_source}"
+            )
+        except Exception as exc:
+            fx_lines.append(f"{label}: n/a ({exc})")
+    fx_block = "\n".join(fx_lines)
 
     try:
         reservoirs_block = fetch_cyprus_reservoirs_summary()
