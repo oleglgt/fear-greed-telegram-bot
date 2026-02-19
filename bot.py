@@ -31,7 +31,7 @@ NEWS_RSS_SOURCES = [
     "https://feeds.reuters.com/Reuters/worldNews",
     "https://www.cnbc.com/id/100727362/device/rss/rss.html",
 ]
-BOT_VERSION = "v1.10.1"
+BOT_VERSION = "v1.10.2"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -690,8 +690,8 @@ def build_news_block() -> str:
         for title in translated_titles:
             lines.append(f"- {title}")
         return "\n".join(lines)
-    except Exception:
-        lines = ["News digest (raw):"]
+    except Exception as exc:
+        lines = [f"News AI: fallback ({exc})", "", "News digest (raw):"]
         for item in items[:5]:
             lines.append(f"- {item['title']}")
         return "\n".join(lines)
@@ -804,6 +804,8 @@ async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
+    openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
     job_names = ", ".join(job.name for job in jobs) if jobs else "(none)"
@@ -813,6 +815,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"- Scheduler: {SCHEDULER_STATUS}\n"
             f"- job_queue available: {has_job_queue}\n"
             f"- TELEGRAM_TARGET_CHAT_ID: {target_chat_id}\n"
+            f"- OPENAI_API_KEY set: {openai_key_set}\n"
+            f"- OPENAI_MODEL: {openai_model}\n"
             f"- jobs: {job_names}"
         )
     )
