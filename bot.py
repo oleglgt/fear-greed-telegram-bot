@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.0"
+BOT_VERSION = "v1.11.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -699,27 +699,8 @@ def build_news_block(force_refresh: bool = False) -> str:
 
     try:
         ai_items = fetch_news_items_via_ai()
-        history = prune_news_history(load_news_history(), now_ts)
-        fresh_items: list[dict[str, str]] = []
-        for item in ai_items:
-            fp = news_item_fingerprint(item)
-            if fp in history:
-                continue
-            fresh_items.append(item)
-
-        if not fresh_items:
-            content = (
-                "News digest:\n"
-                "Новых новостей за последние 72 часа (по истории бота) не найдено.\n\n"
-                f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
-            )
-            NEWS_CACHE["content"] = content
-            NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
-            NEWS_CACHE["updated_at"] = now_ts
-            return content
-
         lines = ["News digest:"]
-        for item in fresh_items[:25]:
+        for item in ai_items[:25]:
             cat = item.get("category", "news").capitalize()
             lines.append(
                 f"- [{cat}] {item['headline_ru']} ({item['source']}, {item['published_at']})"
@@ -727,11 +708,6 @@ def build_news_block(force_refresh: bool = False) -> str:
             lines.append(item["details_en"])
             lines.append(item["url"])
             lines.append("")
-
-        # Persist shown items for 72h dedup.
-        for item in fresh_items:
-            history[news_item_fingerprint(item)] = now_ts
-        save_news_history(prune_news_history(history, now_ts))
 
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
