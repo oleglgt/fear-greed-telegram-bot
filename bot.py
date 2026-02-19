@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.5"
+BOT_VERSION = "v1.11.6"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -652,6 +652,7 @@ def call_openai_chat(
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "temperature": temperature,
         "messages": messages,
+        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "2200")),
     }
 
     for attempt in range(max_attempts):
@@ -738,6 +739,7 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
             ),
         },
     ]
+    combined_ok = False
     if debug_mode:
         debug_logs.append("Step: combined request started")
     try:
@@ -764,8 +766,11 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
                 f"t={len(by_category['technology'])}, "
                 f"m={len(by_category['markets'])})"
             )
+        combined_ok = True
     except Exception as exc:
-        raise NewsFetchError(f"Combined stage failed: {exc}", debug_logs) from exc
+        if debug_mode:
+            debug_logs.append(f"Step: combined request failed ({exc})")
+            debug_logs.append("Step: continue with per-category top-up")
 
     # Top-up only missing categories, one request per missing category.
     for category, count in targets:
@@ -818,10 +823,9 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
                     f"Step: top-up {category} done (have={len(by_category[category])}/{count})"
                 )
         except Exception as exc:
-            raise NewsFetchError(
-                f"Top-up stage failed for {category}: {exc}",
-                debug_logs,
-            ) from exc
+            if debug_mode:
+                debug_logs.append(f"Step: top-up {category} failed ({exc})")
+            continue
 
     final_items: list[dict[str, str]] = []
     for category, count in targets:
@@ -834,6 +838,8 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
             f"m={len(by_category['markets'])}, "
             f"total={len(final_items)}"
         )
+        if not combined_ok:
+            debug_logs.append("Result mode: degraded (combined request timeout/error)")
 
     if not final_items:
         raise NewsFetchError("AI returned no valid news items", debug_logs)
