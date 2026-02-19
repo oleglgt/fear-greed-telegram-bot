@@ -30,7 +30,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.2"
+BOT_VERSION = "v1.11.3"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -635,13 +635,16 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set")
+    timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
+    max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+    max_attempts = max(1, min(max_attempts, 5))
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "temperature": temperature,
         "messages": messages,
     }
 
-    for attempt in range(3):
+    for attempt in range(max_attempts):
         response = requests.post(
             OPENAI_CHAT_COMPLETIONS_URL,
             headers={
@@ -649,7 +652,7 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=45,
+            timeout=timeout_seconds,
         )
         if response.status_code == 429:
             retry_after_raw = response.headers.get("Retry-After", "").strip()
@@ -657,7 +660,7 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
                 retry_after = float(retry_after_raw) if retry_after_raw else 0.0
             except ValueError:
                 retry_after = 0.0
-            if attempt < 2:
+            if attempt < (max_attempts - 1):
                 wait_seconds = max(retry_after, 2.0 * (attempt + 1))
                 time_module.sleep(wait_seconds)
                 continue
@@ -675,51 +678,90 @@ def call_openai_chat(messages: list[dict[str, str]], temperature: float = 0.2) -
 def fetch_news_items_via_ai() -> list[dict[str, str]]:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     targets: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
-    final_items: list[dict[str, str]] = []
+    by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in targets}
     seen: set[str] = set()
 
-    for category, count in targets:
-        collected: list[dict[str, str]] = []
-        for _ in range(2):
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a reliable news research assistant. "
-                        "Find only non-Russian news from the last 24 hours. "
-                        f"Current UTC time is {now_utc}. "
-                        "Return STRICT JSON (no markdown) with schema: "
-                        '{"items":[{"category":"","headline_en":"","headline_ru":"",'
-                        '"source":"","published_at":"","details_en":"","url":""}]}. '
-                        "Use ISO format for published_at when possible (example: 2026-02-19T14:05:00Z). "
-                        "headline_ru must be short Russian translation of headline_en. "
-                        "details_en must be one concise English paragraph."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Return exactly {count} top {category} news items from the last 24 hours. "
-                        f"Set category to '{category}' for every item. "
-                        "Each item must include source, published_at, details_en, and original url."
-                    ),
-                },
-            ]
-            text = call_openai_chat(messages, temperature=0.1)
-            parsed_items = parse_ai_news_items(text)
+    # Fast path: one combined request first.
+    combined_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a reliable news research assistant. "
+                "Find only non-Russian news from the last 24 hours. "
+                f"Current UTC time is {now_utc}. "
+                "Return STRICT JSON (no markdown) with schema: "
+                '{"items":[{"category":"politics|technology|markets","headline_en":"",'
+                '"headline_ru":"","source":"","published_at":"","details_en":"","url":""}]}. '
+                "Use category only as politics, technology, or markets. "
+                "Use ISO format for published_at when possible. "
+                "headline_ru must be short Russian translation of headline_en. "
+                "details_en must be one concise English paragraph."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Return exactly 25 items total from last 24 hours: "
+                "5 politics, 10 technology, 10 markets. "
+                "Each item must include source, published_at, details_en, and original url."
+            ),
+        },
+    ]
+    combined_text = call_openai_chat(combined_messages, temperature=0.1)
+    for item in parse_ai_news_items(combined_text):
+        cat = normalize_category(item.get("category", ""))
+        if cat not in by_category:
+            continue
+        fp = news_item_fingerprint(item)
+        if fp in seen:
+            continue
+        if len(by_category[cat]) < dict(targets)[cat]:
+            by_category[cat].append(item)
+            seen.add(fp)
 
-            for item in parsed_items:
-                fp = news_item_fingerprint(item)
-                if fp in seen:
-                    continue
-                item["category"] = category
-                collected.append(item)
-                seen.add(fp)
-                if len(collected) >= count:
-                    break
-            if len(collected) >= count:
+    # Top-up only missing categories, one request per missing category.
+    for category, count in targets:
+        missing = count - len(by_category[category])
+        if missing <= 0:
+            continue
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a reliable news research assistant. "
+                    "Find only non-Russian news from the last 24 hours. "
+                    f"Current UTC time is {now_utc}. "
+                    "Return STRICT JSON (no markdown) with schema: "
+                    '{"items":[{"category":"","headline_en":"","headline_ru":"",'
+                    '"source":"","published_at":"","details_en":"","url":""}]}. '
+                    "Use ISO format for published_at when possible (example: 2026-02-19T14:05:00Z). "
+                    "headline_ru must be short Russian translation of headline_en. "
+                    "details_en must be one concise English paragraph."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Return exactly {missing} top {category} news items from the last 24 hours. "
+                    f"Set category to '{category}' for every item. "
+                    "Each item must include source, published_at, details_en, and original url."
+                ),
+            },
+        ]
+        text = call_openai_chat(messages, temperature=0.1)
+        for item in parse_ai_news_items(text):
+            fp = news_item_fingerprint(item)
+            if fp in seen:
+                continue
+            item["category"] = category
+            by_category[category].append(item)
+            seen.add(fp)
+            if len(by_category[category]) >= count:
                 break
-        final_items.extend(collected[:count])
+
+    final_items: list[dict[str, str]] = []
+    for category, count in targets:
+        final_items.extend(by_category[category][:count])
 
     if not final_items:
         raise ValueError("AI returned no valid news items")
