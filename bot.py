@@ -25,7 +25,7 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
-BOT_VERSION = "v1.9.0"
+BOT_VERSION = "v1.9.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -553,16 +553,18 @@ def build_fear_greed_block() -> str:
     except Exception as exc:
         crypto_block = f"Crypto Fear & Greed: ошибка ({exc})"
 
+    return f"{stock_block}\n{crypto_block}"
+
+
+def build_st_block() -> str:
     try:
         btc_price, spx_price = fetch_market_prices()
-        prices_block = (
+        return (
             f"Bitcoin (BTC-USD): ${btc_price:,.2f}\n"
             f"S&P 500 (^GSPC): {spx_price:,.2f}"
         )
     except Exception as exc:
-        prices_block = f"Рыночные цены: временно недоступны ({exc})"
-
-    return f"{stock_block}\n\n{crypto_block}\n\n{prices_block}"
+        return f"Рыночные цены: временно недоступны ({exc})"
 
 
 def build_fx_block() -> str:
@@ -586,9 +588,10 @@ def build_dam_block() -> str:
 
 def build_all_report_text() -> str:
     fg_block = build_fear_greed_block()
+    st_block = build_st_block()
     fx_block = build_fx_block()
     dam_block = build_dam_block()
-    return with_version(f"{fg_block}\n\n{fx_block}\n\n{dam_block}")
+    return with_version(f"{fg_block}\n\n{st_block}\n\n{fx_block}\n\n{dam_block}")
 
 
 def get_target_chat_id() -> int | None:
@@ -604,6 +607,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Привет! Я показываю Fear & Greed Index.\n"
             "Команды:\n"
             "/fg - Fear & Greed блок\n"
+            "/st - Bitcoin и S&P\n"
             "/fx - валюты\n"
             "/dam - Cyprus reservoirs\n"
             "/all - все блоки\n\n"
@@ -619,6 +623,10 @@ async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def fx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(with_version(build_fx_block()))
+
+
+async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(with_version(build_st_block()))
 
 
 async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -669,6 +677,7 @@ async def on_startup(app) -> None:
         [
             BotCommand("start", "помощь"),
             BotCommand("fg", "Fear & Greed блок"),
+            BotCommand("st", "Bitcoin и S&P"),
             BotCommand("fx", "валюты"),
             BotCommand("dam", "Cyprus reservoirs"),
             BotCommand("all", "все блоки"),
@@ -706,6 +715,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fg", fg))
+    app.add_handler(CommandHandler("st", st))
     app.add_handler(CommandHandler("fx", fx))
     app.add_handler(CommandHandler("dam", dam))
     app.add_handler(CommandHandler("all", all_report))
