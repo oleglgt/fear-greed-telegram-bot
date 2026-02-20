@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import textwrap
 import time as time_module
 import zipfile
 from datetime import datetime, time, timezone
@@ -771,6 +772,7 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
                 "source": source,
                 "published_at": format_cyprus_time(published_dt),
                 "details_en": details or "Details are not available in feed.",
+                "details_ru": "",
                 "url": link,
                 "_published_dt": published_dt.isoformat(),
             }
@@ -814,6 +816,7 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
                 "source": source,
                 "published_at": format_cyprus_time(published_dt),
                 "details_en": details or "Details are not available in feed.",
+                "details_ru": "",
                 "url": link,
                 "_published_dt": published_dt.isoformat(),
             }
@@ -821,56 +824,121 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
     return out
 
 
-def translate_headlines_best_effort(items: list[dict[str, str]], debug_logs: list[str]) -> None:
+def parse_json_payload(text: str) -> object:
+    payload = text.strip()
+    if payload.startswith("```"):
+        payload = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", payload)
+        payload = re.sub(r"\\n?```$", "", payload).strip()
+    return json.loads(payload)
+
+
+def translate_news_best_effort(
+    items: list[dict[str, str]], debug_logs: list[str] | None = None
+) -> None:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key or not items:
         if debug_logs is not None:
             debug_logs.append("Translation: skipped (no OPENAI_API_KEY or empty list)")
         return
-    payload_items = [
-        {"id": idx, "headline_en": item["headline_en"]} for idx, item in enumerate(items)
-    ]
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Translate English headlines to short natural Russian. "
-                "Return strict JSON: {\"items\":[{\"id\":0,\"headline_ru\":\"...\"}]}"
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps({"items": payload_items}, ensure_ascii=False),
-        },
-    ]
-    try:
-        text = call_openai_chat(
-            messages,
-            temperature=0.0,
-            stage_label="headline translation",
-        )
-        parsed = parse_ai_news_items(text)
-        ru_by_id: dict[int, str] = {}
-        # parse_ai_news_items expects full schema; use lightweight fallback parse too
-        if not parsed:
-            raw = json.loads(text)
+    batch_size = int(os.getenv("NEWS_TRANSLATE_BATCH_SIZE", "5"))
+    batch_size = max(1, min(batch_size, 10))
+    translated_any = False
+    for start in range(0, len(items), batch_size):
+        batch = items[start : start + batch_size]
+        payload_items = [
+            {
+                "id": idx + start,
+                "headline_en": item["headline_en"],
+                "details_en": item["details_en"],
+            }
+            for idx, item in enumerate(batch)
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Translate news fields from English to Russian. "
+                    "Return strict JSON only with schema: "
+                    '{"items":[{"id":0,"headline_ru":"","details_ru":""}]}. '
+                    "headline_ru should be short and natural. "
+                    "details_ru should be informative and concise, formatted as 8-10 short lines "
+                    "separated by newline characters. Do not add markdown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"items": payload_items}, ensure_ascii=False),
+            },
+        ]
+        try:
+            text = call_openai_chat(
+                messages,
+                temperature=0.0,
+                stage_label=f"news translation batch {start // batch_size + 1}",
+            )
+            raw = parse_json_payload(text)
+            if not isinstance(raw, dict):
+                continue
             rows = raw.get("items", [])
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict) and "id" in row and "headline_ru" in row:
-                        try:
-                            ru_by_id[int(row["id"])] = normalize_text(str(row["headline_ru"]))
-                        except (TypeError, ValueError):
-                            continue
-        for idx, item in enumerate(items):
-            translated = ru_by_id.get(idx)
-            if translated:
-                item["headline_ru"] = translated
-        if debug_logs is not None:
-            debug_logs.append("Translation: done")
-    except Exception as exc:
-        if debug_logs is not None:
-            debug_logs.append(f"Translation: skipped ({exc})")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    idx = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if idx < 0 or idx >= len(items):
+                    continue
+                headline_ru = normalize_text(str(row.get("headline_ru", "")))
+                details_ru_raw = str(row.get("details_ru", ""))
+                details_ru_lines = [normalize_text(x) for x in details_ru_raw.splitlines()]
+                details_ru = "\n".join([line for line in details_ru_lines if line]).strip()
+                if headline_ru:
+                    items[idx]["headline_ru"] = headline_ru
+                if details_ru:
+                    items[idx]["details_ru"] = details_ru
+                translated_any = True
+        except Exception as exc:
+            if debug_logs is not None:
+                debug_logs.append(f"Translation batch failed ({exc})")
+            continue
+    if debug_logs is not None:
+        debug_logs.append("Translation: done" if translated_any else "Translation: skipped")
+
+
+def format_expanded_details(item: dict[str, str]) -> str:
+    raw = item.get("details_ru") or item.get("details_en") or ""
+    text = raw.strip()
+    if not text:
+        return "Подробности недоступны."
+
+    if "\n" in text:
+        lines = [normalize_text(line) for line in text.splitlines() if normalize_text(line)]
+    else:
+        lines: list[str] = []
+        for sentence in re.split(r"(?<=[.!?])\s+", normalize_text(text)):
+            if not sentence:
+                continue
+            lines.extend(
+                textwrap.wrap(
+                    sentence,
+                    width=72,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+            )
+            if len(lines) >= 10:
+                break
+        if len(lines) < 8:
+            lines = textwrap.wrap(
+                normalize_text(text),
+                width=56,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+    return "\n".join(lines[:10]) if lines else "Подробности недоступны."
 
 
 def call_openai_chat(
@@ -995,7 +1063,7 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     for category, count in NEWS_TARGETS:
         final_items.extend(by_category[category][:count])
 
-    translate_headlines_best_effort(final_items, debug_logs if debug_mode else [])
+    translate_news_best_effort(final_items, debug_logs if debug_mode else None)
 
     if debug_mode:
         debug_logs.append(
@@ -1039,13 +1107,14 @@ def build_news_block(
             lines = ["News digest:"]
         for item in ai_items[:25]:
             cat = item.get("category", "news").capitalize()
+            expanded_details = format_expanded_details(item)
             if use_spoilers and not debug_mode:
                 lines.append(
                     f"• <b>[{html_escape(cat)}] {html_escape(item['headline_ru'])}</b> "
                     f"({html_escape(item['source'])}, {html_escape(item['published_at'])})"
                 )
                 lines.append(
-                    f"<blockquote expandable>{html_escape(item['details_en'])}</blockquote>"
+                    f"<blockquote expandable>{html_escape(expanded_details)}</blockquote>"
                 )
                 safe_url = html_escape(item["url"], quote=True)
                 lines.append(f'<a href="{safe_url}">Source link</a>')
@@ -1053,7 +1122,7 @@ def build_news_block(
                 lines.append(
                     f"- [{cat}] {item['headline_ru']} ({item['source']}, {item['published_at']})"
                 )
-                lines.append(item["details_en"])
+                lines.append(expanded_details)
                 lines.append(item["url"])
             lines.append("")
 
