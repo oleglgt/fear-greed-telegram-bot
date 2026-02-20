@@ -56,7 +56,7 @@ LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
-NEWS_TARGETS: list[tuple[str, int]] = [("politics", 1), ("technology", 2), ("markets", 2)]
+NEWS_TARGETS: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
     "politics": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
