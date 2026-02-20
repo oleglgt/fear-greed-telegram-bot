@@ -5,6 +5,8 @@ import re
 import time as time_module
 import zipfile
 from datetime import datetime, time, timezone
+from email.utils import parsedate_to_datetime
+from html import unescape
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
@@ -30,7 +32,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.11.7"
+BOT_VERSION = "v1.12.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -54,6 +56,24 @@ LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
+NEWS_TARGETS: list[tuple[str, int]] = [("politics", 1), ("technology", 2), ("markets", 2)]
+NEWS_RSS_FEEDS: dict[str, list[str]] = {
+    "politics": [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://rss.cnn.com/rss/edition_world.rss",
+        "https://www.theguardian.com/world/rss",
+    ],
+    "technology": [
+        "https://techcrunch.com/feed/",
+        "https://www.theverge.com/rss/index.xml",
+        "https://feeds.arstechnica.com/arstechnica/index",
+    ],
+    "markets": [
+        "https://www.marketwatch.com/rss/topstories",
+        "https://feeds.reuters.com/reuters/businessNews",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    ],
+}
 
 
 class NewsFetchError(Exception):
@@ -637,6 +657,161 @@ def parse_ai_news_items(text: str) -> list[dict[str, str]]:
     return out
 
 
+def parse_feed_datetime(raw: str) -> datetime | None:
+    text = normalize_text(raw)
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    candidates = [
+        text,
+        text.replace("Z", "+00:00"),
+    ]
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
+    root = ET.fromstring(xml_text)
+    out: list[dict[str, str]] = []
+
+    # RSS format: channel/item
+    rss_items = root.findall(".//channel/item")
+    for node in rss_items:
+        title = normalize_text(unescape(node.findtext("title", default="")))
+        link = normalize_text(node.findtext("link", default=""))
+        source = normalize_text(node.findtext("source", default="")) or "RSS"
+        details = normalize_text(unescape(node.findtext("description", default="")))
+        published_raw = (
+            node.findtext("pubDate", default="")
+            or node.findtext("date", default="")
+            or node.findtext("{http://purl.org/dc/elements/1.1/}date", default="")
+        )
+        published_dt = parse_feed_datetime(published_raw)
+        if not title or not link or not published_dt:
+            continue
+        out.append(
+            {
+                "category": category,
+                "headline_en": title,
+                "headline_ru": title,
+                "source": source,
+                "published_at": format_cyprus_time(published_dt),
+                "details_en": details or "Details are not available in feed.",
+                "url": link,
+                "_published_dt": published_dt.isoformat(),
+            }
+        )
+
+    # Atom format: entry with XML namespace.
+    atom_entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+    for node in atom_entries:
+        title = normalize_text(
+            unescape(node.findtext("{http://www.w3.org/2005/Atom}title", default=""))
+        )
+        source = "RSS"
+        details = normalize_text(
+            unescape(node.findtext("{http://www.w3.org/2005/Atom}summary", default=""))
+        )
+        if not details:
+            details = normalize_text(
+                unescape(node.findtext("{http://www.w3.org/2005/Atom}content", default=""))
+            )
+        link = ""
+        for link_node in node.findall("{http://www.w3.org/2005/Atom}link"):
+            href = normalize_text(link_node.attrib.get("href", ""))
+            rel = normalize_text(link_node.attrib.get("rel", "alternate")).lower()
+            if href and rel in {"", "alternate"}:
+                link = href
+                break
+            if href and not link:
+                link = href
+        published_raw = (
+            node.findtext("{http://www.w3.org/2005/Atom}updated", default="")
+            or node.findtext("{http://www.w3.org/2005/Atom}published", default="")
+        )
+        published_dt = parse_feed_datetime(published_raw)
+        if not title or not link or not published_dt:
+            continue
+        out.append(
+            {
+                "category": category,
+                "headline_en": title,
+                "headline_ru": title,
+                "source": source,
+                "published_at": format_cyprus_time(published_dt),
+                "details_en": details or "Details are not available in feed.",
+                "url": link,
+                "_published_dt": published_dt.isoformat(),
+            }
+        )
+    return out
+
+
+def translate_headlines_best_effort(items: list[dict[str, str]], debug_logs: list[str]) -> None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key or not items:
+        if debug_logs is not None:
+            debug_logs.append("Translation: skipped (no OPENAI_API_KEY or empty list)")
+        return
+    payload_items = [
+        {"id": idx, "headline_en": item["headline_en"]} for idx, item in enumerate(items)
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Translate English headlines to short natural Russian. "
+                "Return strict JSON: {\"items\":[{\"id\":0,\"headline_ru\":\"...\"}]}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps({"items": payload_items}, ensure_ascii=False),
+        },
+    ]
+    try:
+        text = call_openai_chat(
+            messages,
+            temperature=0.0,
+            stage_label="headline translation",
+        )
+        parsed = parse_ai_news_items(text)
+        ru_by_id: dict[int, str] = {}
+        # parse_ai_news_items expects full schema; use lightweight fallback parse too
+        if not parsed:
+            raw = json.loads(text)
+            rows = raw.get("items", [])
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and "id" in row and "headline_ru" in row:
+                        try:
+                            ru_by_id[int(row["id"])] = normalize_text(str(row["headline_ru"]))
+                        except (TypeError, ValueError):
+                            continue
+        for idx, item in enumerate(items):
+            translated = ru_by_id.get(idx)
+            if translated:
+                item["headline_ru"] = translated
+        if debug_logs is not None:
+            debug_logs.append("Translation: done")
+    except Exception as exc:
+        if debug_logs is not None:
+            debug_logs.append(f"Translation: skipped ({exc})")
+
+
 def call_openai_chat(
     messages: list[dict[str, str]],
     temperature: float = 0.2,
@@ -704,132 +879,63 @@ def call_openai_chat(
 
 
 def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, str]], list[str]]:
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    targets: list[tuple[str, int]] = [("politics", 1), ("technology", 2), ("markets", 2)]
-    by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in targets}
+    now_utc_dt = datetime.now(timezone.utc)
+    now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff = now_utc_dt.timestamp() - 24 * 3600
+    by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in NEWS_TARGETS}
     seen: set[str] = set()
     debug_logs: list[str] = []
     if debug_mode:
         debug_logs.append(f"UTC now: {now_utc}")
         debug_logs.append("Cache: miss (forced live fetch)")
-
-    # Fast path: one combined request first.
-    combined_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a reliable news research assistant. "
-                "Find only non-Russian news from the last 24 hours. "
-                f"Current UTC time is {now_utc}. "
-                "Return STRICT JSON (no markdown) with schema: "
-                '{"items":[{"category":"politics|technology|markets","headline_en":"",'
-                '"headline_ru":"","source":"","published_at":"","details_en":"","url":""}]}. '
-                "Use category only as politics, technology, or markets. "
-                "Use ISO format for published_at when possible. "
-                "headline_ru must be short Russian translation of headline_en. "
-                "details_en must be one concise English paragraph."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Return exactly 5 items total from last 24 hours: "
-                "1 politics, 2 technology, 2 markets. "
-                "Each item must include source, published_at, details_en, and original url."
-            ),
-        },
-    ]
-    combined_ok = False
-    if debug_mode:
-        debug_logs.append("Step: combined request started")
-    try:
-        combined_text = call_openai_chat(
-            combined_messages,
-            temperature=0.1,
-            stage_label="combined request",
-        )
-        parsed_combined = parse_ai_news_items(combined_text)
-        for item in parsed_combined:
-            cat = normalize_category(item.get("category", ""))
-            if cat not in by_category:
+    for category, count in NEWS_TARGETS:
+        if debug_mode:
+            debug_logs.append(f"RSS: category {category} target {count}")
+        feeds = NEWS_RSS_FEEDS.get(category, [])
+        collected: list[dict[str, str]] = []
+        for feed_url in feeds:
+            if len(collected) >= count:
+                break
+            try:
+                xml_text = get_url_text(feed_url)
+                feed_items = parse_news_feed_items(xml_text, category)
+                fresh_items: list[dict[str, str]] = []
+                for item in feed_items:
+                    published_raw = item.pop("_published_dt", "")
+                    published_dt = parse_feed_datetime(published_raw)
+                    if not published_dt:
+                        continue
+                    if published_dt.timestamp() < cutoff:
+                        continue
+                    fp = news_item_fingerprint(item)
+                    if fp in seen:
+                        continue
+                    seen.add(fp)
+                    item["_ts"] = str(published_dt.timestamp())
+                    fresh_items.append(item)
+                fresh_items.sort(key=lambda x: float(x.get("_ts", "0")), reverse=True)
+                for item in fresh_items:
+                    if len(collected) >= count:
+                        break
+                    item.pop("_ts", None)
+                    collected.append(item)
+                if debug_mode:
+                    debug_logs.append(
+                        f"RSS: {category} from {feed_url} +{len(fresh_items)} "
+                        f"(have={len(collected)}/{count})"
+                    )
+            except Exception as exc:
+                if debug_mode:
+                    debug_logs.append(f"RSS: {category} source failed {feed_url} ({exc})")
                 continue
-            fp = news_item_fingerprint(item)
-            if fp in seen:
-                continue
-            if len(by_category[cat]) < dict(targets)[cat]:
-                by_category[cat].append(item)
-                seen.add(fp)
-        if debug_mode:
-            debug_logs.append(
-                "Step: combined request done "
-                f"(p={len(by_category['politics'])}, "
-                f"t={len(by_category['technology'])}, "
-                f"m={len(by_category['markets'])})"
-            )
-        combined_ok = True
-    except Exception as exc:
-        if debug_mode:
-            debug_logs.append(f"Step: combined request failed ({exc})")
-            debug_logs.append("Step: continue with per-category top-up")
-
-    # Top-up only missing categories, one request per missing category.
-    for category, count in targets:
-        missing = count - len(by_category[category])
-        if missing <= 0:
-            continue
-        if debug_mode:
-            debug_logs.append(f"Step: top-up {category} started (missing={missing})")
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a reliable news research assistant. "
-                    "Find only non-Russian news from the last 24 hours. "
-                    f"Current UTC time is {now_utc}. "
-                    "Return STRICT JSON (no markdown) with schema: "
-                    '{"items":[{"category":"","headline_en":"","headline_ru":"",'
-                    '"source":"","published_at":"","details_en":"","url":""}]}. '
-                    "Use ISO format for published_at when possible (example: 2026-02-19T14:05:00Z). "
-                    "headline_ru must be short Russian translation of headline_en. "
-                    "details_en must be one concise English paragraph."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Return exactly {missing} top {category} news items from the last 24 hours. "
-                    f"Set category to '{category}' for every item. "
-                    "Each item must include source, published_at, details_en, and original url."
-                ),
-            },
-        ]
-        try:
-            text = call_openai_chat(
-                messages,
-                temperature=0.1,
-                stage_label=f"top-up {category}",
-            )
-            for item in parse_ai_news_items(text):
-                fp = news_item_fingerprint(item)
-                if fp in seen:
-                    continue
-                item["category"] = category
-                by_category[category].append(item)
-                seen.add(fp)
-                if len(by_category[category]) >= count:
-                    break
-            if debug_mode:
-                debug_logs.append(
-                    f"Step: top-up {category} done (have={len(by_category[category])}/{count})"
-                )
-        except Exception as exc:
-            if debug_mode:
-                debug_logs.append(f"Step: top-up {category} failed ({exc})")
-            continue
+        by_category[category] = collected[:count]
 
     final_items: list[dict[str, str]] = []
-    for category, count in targets:
+    for category, count in NEWS_TARGETS:
         final_items.extend(by_category[category][:count])
+
+    translate_headlines_best_effort(final_items, debug_logs if debug_mode else [])
+
     if debug_mode:
         debug_logs.append(
             "Final items: "
@@ -838,11 +944,9 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
             f"m={len(by_category['markets'])}, "
             f"total={len(final_items)}"
         )
-        if not combined_ok:
-            debug_logs.append("Result mode: degraded (combined request timeout/error)")
 
     if not final_items:
-        raise NewsFetchError("AI returned no valid news items", debug_logs)
+        raise NewsFetchError("No fresh RSS items from last 24h", debug_logs)
     return final_items, debug_logs
 
 
