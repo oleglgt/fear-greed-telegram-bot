@@ -57,6 +57,7 @@ CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
 NEWS_TARGETS: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
+MAX_TELEGRAM_MESSAGE_LEN = 3900
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
     "politics": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -84,6 +85,46 @@ class NewsFetchError(Exception):
 
 def with_version(text: str) -> str:
     return f"[{BOT_VERSION}]\n{text}"
+
+
+def split_telegram_text(text: str, max_len: int = MAX_TELEGRAM_MESSAGE_LEN) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= max_len:
+            current = block
+            continue
+        # Hard-split very long blocks.
+        start = 0
+        while start < len(block):
+            end = start + max_len
+            chunks.append(block[start:end])
+            start = end
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def reply_long_text(update: Update, text: str) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    for chunk in split_telegram_text(text):
+        await message.reply_text(chunk)
+
+
+async def send_long_text_to_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    for chunk in split_telegram_text(text):
+        await context.bot.send_message(chat_id=chat_id, text=chunk)
 
 
 def parse_timestamp_utc(timestamp_raw: object) -> datetime:
@@ -1121,13 +1162,14 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         debug_mode = first in {"debug", "dbg", "trace"}
     if debug_mode:
         force_refresh = True
-    await update.message.reply_text(
-        with_version(build_news_block(force_refresh=force_refresh, debug_mode=debug_mode))
+    await reply_long_text(
+        update,
+        with_version(build_news_block(force_refresh=force_refresh, debug_mode=debug_mode)),
     )
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(build_all_report_text())
+    await reply_long_text(update, build_all_report_text())
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1152,7 +1194,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    await context.bot.send_message(chat_id=chat_id, text=build_all_report_text())
+    await send_long_text_to_chat(context, chat_id, build_all_report_text())
 
 
 async def on_startup(app) -> None:
