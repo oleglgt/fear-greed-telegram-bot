@@ -33,7 +33,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.12.0"
+BOT_VERSION = "v1.12.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -56,7 +56,7 @@ LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
-NEWS_CACHE: dict[str, object] = {"expires_at": 0.0, "content": "", "updated_at": 0.0}
+NEWS_CACHE: dict[str, object] = {}
 NEWS_TARGETS: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
 MAX_TELEGRAM_MESSAGE_LEN = 3900
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
@@ -1085,12 +1085,15 @@ def build_news_block(
     ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
     fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
     now_ts = datetime.now(timezone.utc).timestamp()
+    cache_key = "html" if (use_spoilers and not debug_mode) else "plain"
+    cached_entry = NEWS_CACHE.get(cache_key)
     if (
         not force_refresh
-        and NEWS_CACHE.get("content")
-        and float(NEWS_CACHE.get("expires_at", 0.0)) > now_ts
+        and isinstance(cached_entry, dict)
+        and cached_entry.get("content")
+        and float(cached_entry.get("expires_at", 0.0)) > now_ts
     ):
-        cached = str(NEWS_CACHE["content"])
+        cached = str(cached_entry["content"])
         if debug_mode:
             return f"News service (debug):\n- Cache: hit\n\n{cached}"
         return cached
@@ -1129,9 +1132,11 @@ def build_news_block(
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
-        NEWS_CACHE["content"] = content
-        NEWS_CACHE["expires_at"] = now_ts + max(ttl, 60)
-        NEWS_CACHE["updated_at"] = now_ts
+        NEWS_CACHE[cache_key] = {
+            "content": content,
+            "expires_at": now_ts + max(ttl, 60),
+            "updated_at": now_ts,
+        }
         return content
     except NewsFetchError as exc:
         lines = [f"News AI: fallback ({exc})"]
@@ -1143,18 +1148,22 @@ def build_news_block(
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
-        NEWS_CACHE["content"] = content
-        NEWS_CACHE["expires_at"] = now_ts + max(fallback_ttl, 30)
-        NEWS_CACHE["updated_at"] = now_ts
+        NEWS_CACHE[cache_key] = {
+            "content": content,
+            "expires_at": now_ts + max(fallback_ttl, 30),
+            "updated_at": now_ts,
+        }
         return content
     except Exception as exc:
         lines = [f"News AI: fallback ({exc})"]
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
-        NEWS_CACHE["content"] = content
-        NEWS_CACHE["expires_at"] = now_ts + max(fallback_ttl, 30)
-        NEWS_CACHE["updated_at"] = now_ts
+        NEWS_CACHE[cache_key] = {
+            "content": content,
+            "expires_at": now_ts + max(fallback_ttl, 30),
+            "updated_at": now_ts,
+        }
         return content
 
 
