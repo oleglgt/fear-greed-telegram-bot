@@ -33,7 +33,7 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.12.1"
+BOT_VERSION = "v1.12.3"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -140,12 +140,72 @@ async def send_long_text_to_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         await context.bot.send_message(chat_id=chat_id, text=chunk)
 
 
+async def send_long_text_to_chat_html(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+) -> None:
+    for chunk in split_telegram_text(text):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
 async def reply_long_text_html(update: Update, text: str) -> None:
     message = update.effective_message
     if message is None:
         return
     for chunk in split_telegram_text(text):
         await message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+def render_block(
+    block_name: str,
+    *,
+    include_version: bool = False,
+    force_refresh: bool = False,
+    debug_mode: bool = False,
+    news_spoilers: bool = True,
+) -> tuple[str, bool]:
+    html_mode = False
+    if block_name == "fg":
+        text = build_fear_greed_block()
+    elif block_name == "st":
+        text = build_st_block()
+    elif block_name == "fx":
+        text = build_fx_block()
+    elif block_name == "dam":
+        text = build_dam_block()
+    elif block_name == "news":
+        html_mode = news_spoilers and not debug_mode
+        text = build_news_block(
+            force_refresh=force_refresh,
+            debug_mode=debug_mode,
+            use_spoilers=html_mode,
+        )
+    else:
+        raise ValueError(f"Unknown block: {block_name}")
+
+    if include_version:
+        text = with_version(text)
+    return text, html_mode
+
+
+async def send_rendered_update(update: Update, text: str, html_mode: bool) -> None:
+    if html_mode:
+        await reply_long_text_html(update, text)
+    else:
+        await reply_long_text(update, text)
+
+
+async def send_rendered_chat(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, html_mode: bool
+) -> None:
+    if html_mode:
+        await send_long_text_to_chat_html(context, chat_id, text)
+    else:
+        await send_long_text_to_chat(context, chat_id, text)
 
 
 def parse_timestamp_utc(timestamp_raw: object) -> datetime:
@@ -1213,17 +1273,6 @@ def build_dam_block() -> str:
         return f"Cyprus reservoirs: временно недоступно ({exc})"
 
 
-def build_all_report_text() -> str:
-    fg_block = build_fear_greed_block()
-    st_block = build_st_block()
-    fx_block = build_fx_block()
-    dam_block = build_dam_block()
-    news_block = build_news_block()
-    return with_version(
-        f"{fg_block}\n\n{st_block}\n\n{fx_block}\n\n{dam_block}\n\n{news_block}"
-    )
-
-
 def get_target_chat_id() -> int | None:
     raw = os.getenv("TELEGRAM_TARGET_CHAT_ID", "").strip()
     if not raw:
@@ -1249,19 +1298,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(with_version(build_fear_greed_block()))
+    text, html_mode = render_block("fg", include_version=True)
+    await send_rendered_update(update, text, html_mode)
 
 
 async def fx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(with_version(build_fx_block()))
+    text, html_mode = render_block("fx", include_version=True)
+    await send_rendered_update(update, text, html_mode)
 
 
 async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(with_version(build_st_block()))
+    text, html_mode = render_block("st", include_version=True)
+    await send_rendered_update(update, text, html_mode)
 
 
 async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(with_version(build_dam_block()))
+    text, html_mode = render_block("dam", include_version=True)
+    await send_rendered_update(update, text, html_mode)
 
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1273,21 +1326,25 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         debug_mode = first in {"debug", "dbg", "trace"}
     if debug_mode:
         force_refresh = True
-    text = with_version(
-        build_news_block(
-            force_refresh=force_refresh,
-            debug_mode=debug_mode,
-            use_spoilers=not debug_mode,
-        )
+    text, html_mode = render_block(
+        "news",
+        include_version=True,
+        force_refresh=force_refresh,
+        debug_mode=debug_mode,
+        news_spoilers=True,
     )
-    if debug_mode:
-        await reply_long_text(update, text)
-    else:
-        await reply_long_text_html(update, text)
+    await send_rendered_update(update, text, html_mode)
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply_long_text(update, build_all_report_text())
+    block_order = ["fg", "st", "fx", "dam", "news"]
+    for idx, block_name in enumerate(block_order):
+        text, html_mode = render_block(
+            block_name,
+            include_version=(idx == 0),
+            news_spoilers=True,
+        )
+        await send_rendered_update(update, text, html_mode)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1314,7 +1371,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    await send_long_text_to_chat(context, chat_id, build_all_report_text())
+    block_order = ["fg", "st", "fx", "dam", "news"]
+    for idx, block_name in enumerate(block_order):
+        text, html_mode = render_block(
+            block_name,
+            include_version=(idx == 0),
+            news_spoilers=True,
+        )
+        await send_rendered_chat(context, chat_id, text, html_mode)
 
 
 async def on_startup(app) -> None:
