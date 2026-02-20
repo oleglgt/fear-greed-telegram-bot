@@ -1044,7 +1044,9 @@ def build_news_block(
                     f"• <b>[{html_escape(cat)}] {html_escape(item['headline_ru'])}</b> "
                     f"({html_escape(item['source'])}, {html_escape(item['published_at'])})"
                 )
-                lines.append(f"<tg-spoiler>{html_escape(item['details_en'])}</tg-spoiler>")
+                lines.append(
+                    f"<blockquote expandable>{html_escape(item['details_en'])}</blockquote>"
+                )
                 safe_url = html_escape(item["url"], quote=True)
                 lines.append(f'<a href="{safe_url}">Source link</a>')
             else:
