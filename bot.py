@@ -6,7 +6,7 @@ import time as time_module
 import zipfile
 from datetime import datetime, time, timezone
 from email.utils import parsedate_to_datetime
-from html import unescape
+from html import escape as html_escape, unescape
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
@@ -87,6 +87,18 @@ def with_version(text: str) -> str:
     return f"[{BOT_VERSION}]\n{text}"
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def split_telegram_text(text: str, max_len: int = MAX_TELEGRAM_MESSAGE_LEN) -> list[str]:
     if len(text) <= max_len:
         return [text]
@@ -125,6 +137,14 @@ async def reply_long_text(update: Update, text: str) -> None:
 async def send_long_text_to_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     for chunk in split_telegram_text(text):
         await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def reply_long_text_html(update: Update, text: str) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    for chunk in split_telegram_text(text):
+        await message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
 
 def parse_timestamp_utc(timestamp_raw: object) -> datetime:
@@ -991,7 +1011,9 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     return final_items, debug_logs
 
 
-def build_news_block(force_refresh: bool = False, debug_mode: bool = False) -> str:
+def build_news_block(
+    force_refresh: bool = False, debug_mode: bool = False, use_spoilers: bool = False
+) -> str:
     ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
     fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -1017,11 +1039,20 @@ def build_news_block(force_refresh: bool = False, debug_mode: bool = False) -> s
             lines = ["News digest:"]
         for item in ai_items[:25]:
             cat = item.get("category", "news").capitalize()
-            lines.append(
-                f"- [{cat}] {item['headline_ru']} ({item['source']}, {item['published_at']})"
-            )
-            lines.append(item["details_en"])
-            lines.append(item["url"])
+            if use_spoilers and not debug_mode:
+                lines.append(
+                    f"• <b>[{html_escape(cat)}] {html_escape(item['headline_ru'])}</b> "
+                    f"({html_escape(item['source'])}, {html_escape(item['published_at'])})"
+                )
+                lines.append(f"<tg-spoiler>{html_escape(item['details_en'])}</tg-spoiler>")
+                safe_url = html_escape(item["url"], quote=True)
+                lines.append(f'<a href="{safe_url}">Source link</a>')
+            else:
+                lines.append(
+                    f"- [{cat}] {item['headline_ru']} ({item['source']}, {item['published_at']})"
+                )
+                lines.append(item["details_en"])
+                lines.append(item["url"])
             lines.append("")
 
         lines.append("")
@@ -1162,10 +1193,17 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         debug_mode = first in {"debug", "dbg", "trace"}
     if debug_mode:
         force_refresh = True
-    await reply_long_text(
-        update,
-        with_version(build_news_block(force_refresh=force_refresh, debug_mode=debug_mode)),
+    text = with_version(
+        build_news_block(
+            force_refresh=force_refresh,
+            debug_mode=debug_mode,
+            use_spoilers=not debug_mode,
+        )
     )
+    if debug_mode:
+        await reply_long_text(update, text)
+    else:
+        await reply_long_text_html(update, text)
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1176,6 +1214,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    deploy_notify = "yes" if env_flag("SEND_DEPLOY_NOTIFICATION", True) else "no"
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
     job_names = ", ".join(job.name for job in jobs) if jobs else "(none)"
@@ -1187,6 +1226,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"- TELEGRAM_TARGET_CHAT_ID: {target_chat_id}\n"
             f"- OPENAI_API_KEY set: {openai_key_set}\n"
             f"- OPENAI_MODEL: {openai_model}\n"
+            f"- SEND_DEPLOY_NOTIFICATION: {deploy_notify}\n"
             f"- jobs: {job_names}"
         )
     )
@@ -1232,6 +1272,19 @@ async def on_startup(app) -> None:
         name="daily_report_2000_cyprus",
     )
     SCHEDULER_STATUS = "enabled: 08:00 and 20:00 Europe/Nicosia"
+
+    if env_flag("SEND_DEPLOY_NOTIFICATION", True):
+        try:
+            await app.bot.send_message(
+                chat_id=target_chat_id,
+                text=with_version(
+                    "Deploy: bot restarted successfully.\n"
+                    f"Time: {format_cyprus_time(datetime.now(timezone.utc))}\n"
+                    f"Scheduler: {SCHEDULER_STATUS}"
+                ),
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:
