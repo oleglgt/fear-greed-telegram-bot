@@ -21,7 +21,7 @@ CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
-STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=d"
+STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -34,7 +34,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v1.12.6"
+BOT_VERSION = "v1.12.7"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -533,17 +533,12 @@ def fetch_market_prices() -> tuple[float, float]:
         except Exception:
             pass
 
-    # S&P fallback 1: Stooq (^SPX close price from CSV).
+    # S&P fallback 1: Stooq (^SPX intraday price from CSV).
     if spx_price is None:
         try:
             spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
             spx_response.raise_for_status()
-            lines = [line.strip() for line in spx_response.text.splitlines() if line.strip()]
-            if len(lines) >= 2:
-                row = lines[1].split(",")
-                # CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
-                if len(row) > 6 and row[6] not in {"", "N/D"}:
-                    spx_price = float(row[6])
+            spx_price, _ = parse_stooq_csv_line(spx_response.text)
         except Exception:
             pass
 
