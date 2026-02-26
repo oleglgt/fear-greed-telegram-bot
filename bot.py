@@ -33,7 +33,8 @@ WDD_RESERVOIRS_PAGE_URL = (
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
-BOT_VERSION = "v1.12.3"
+BOT_STATE_FILE = "bot_state.json"
+BOT_VERSION = "v1.12.4"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -726,6 +727,24 @@ def save_news_history(history: dict[str, float]) -> None:
         json.dump(history, f, ensure_ascii=False)
 
 
+def load_bot_state() -> dict[str, object]:
+    try:
+        with open(BOT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_bot_state(state: dict[str, object]) -> None:
+    with open(BOT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+
+
 def prune_news_history(history: dict[str, float], now_ts: float) -> dict[str, float]:
     cutoff = now_ts - (NEWS_HISTORY_HOURS * 3600)
     return {k: ts for k, ts in history.items() if ts >= cutoff}
@@ -1228,28 +1247,95 @@ def build_news_block(
 
 
 def build_fear_greed_block() -> str:
+    state = load_bot_state()
+    prev_fg = state.get("fg")
+    prev_fg_dict = prev_fg if isinstance(prev_fg, dict) else {}
+    next_fg: dict[str, object] = dict(prev_fg_dict)
+    state_dirty = False
+
     try:
         score, rating, updated_at = fetch_fear_and_greed()
         stock_block = f"Stock Fear & Greed (CNN): {score:.2f} {rating} {updated_at}"
+        next_fg["stock_score"] = score
+        next_fg["stock_rating"] = rating
+        next_fg["stock_updated_at"] = updated_at
+        state_dirty = True
     except Exception as exc:
         stock_block = f"Stock Fear & Greed (CNN): ошибка ({exc})"
 
     try:
         c_score, c_rating, c_updated_at = fetch_crypto_fear_and_greed()
         crypto_block = f"Crypto Fear & Greed: {c_score} {c_rating} {c_updated_at}"
+        next_fg["crypto_score"] = c_score
+        next_fg["crypto_rating"] = c_rating
+        next_fg["crypto_updated_at"] = c_updated_at
+        state_dirty = True
     except Exception as exc:
         crypto_block = f"Crypto Fear & Greed: ошибка ({exc})"
 
-    return f"{stock_block}\n{crypto_block}"
+    lines = [stock_block, crypto_block]
+    prev_lines: list[str] = []
+    try:
+        if "stock_score" in prev_fg_dict:
+            prev_lines.append(
+                "Previous Stock Fear & Greed (CNN): "
+                f"{float(prev_fg_dict['stock_score']):.2f} "
+                f"{str(prev_fg_dict.get('stock_rating', 'n/a'))} "
+                f"{str(prev_fg_dict.get('stock_updated_at', 'n/a'))}"
+            )
+        if "crypto_score" in prev_fg_dict:
+            prev_lines.append(
+                "Previous Crypto Fear & Greed: "
+                f"{int(float(prev_fg_dict['crypto_score']))} "
+                f"{str(prev_fg_dict.get('crypto_rating', 'n/a'))} "
+                f"{str(prev_fg_dict.get('crypto_updated_at', 'n/a'))}"
+            )
+    except Exception:
+        prev_lines = []
+    if prev_lines:
+        lines.append("")
+        lines.extend(prev_lines)
+
+    if state_dirty:
+        next_fg["saved_at"] = datetime.now(timezone.utc).isoformat()
+        state["fg"] = next_fg
+        save_bot_state(state)
+
+    return "\n".join(lines)
 
 
 def build_st_block() -> str:
+    state = load_bot_state()
+    prev_st = state.get("st")
+    prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
         btc_price, spx_price = fetch_market_prices()
-        return (
+        current_block = (
             f"Bitcoin (BTC-USD): ${btc_price:,.2f}\n"
             f"S&P 500 (^GSPC): {spx_price:,.2f}"
         )
+        next_st: dict[str, object] = dict(prev_st_dict)
+        next_st["btc_price"] = btc_price
+        next_st["spx_price"] = spx_price
+        next_st["saved_at"] = datetime.now(timezone.utc).isoformat()
+        state["st"] = next_st
+        save_bot_state(state)
+
+        prev_lines: list[str] = []
+        try:
+            if "btc_price" in prev_st_dict:
+                prev_lines.append(
+                    f"Previous Bitcoin (BTC-USD): ${float(prev_st_dict['btc_price']):,.2f}"
+                )
+            if "spx_price" in prev_st_dict:
+                prev_lines.append(
+                    f"Previous S&P 500 (^GSPC): {float(prev_st_dict['spx_price']):,.2f}"
+                )
+        except Exception:
+            prev_lines = []
+        if prev_lines:
+            return f"{current_block}\n\n" + "\n".join(prev_lines)
+        return current_block
     except Exception as exc:
         return f"Рыночные цены: временно недоступны ({exc})"
 
