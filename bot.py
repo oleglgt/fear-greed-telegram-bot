@@ -1,3 +1,4 @@
+import asyncio
 import os
 import io
 import json
@@ -7,12 +8,14 @@ import time as time_module
 import zipfile
 from datetime import datetime, time, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from html import escape as html_escape, unescape
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
 
 import requests
+from dotenv import load_dotenv
 from telegram import BotCommand, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -34,7 +37,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v1.12.7"
+BOT_VERSION = "v1.13.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -55,6 +58,7 @@ REQUEST_HEADERS_GENERIC = {
 }
 LAST_BTC_PRICE: float | None = None
 LAST_SPX_PRICE: float | None = None
+ALLOWED_USER_ID: int | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {}
@@ -193,6 +197,11 @@ def render_block(
     return text, html_mode
 
 
+async def render_block_async(**kwargs) -> tuple[str, bool]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(render_block, **kwargs))
+
+
 async def send_rendered_update(update: Update, text: str, html_mode: bool) -> None:
     if html_mode:
         await reply_long_text_html(update, text)
@@ -281,45 +290,21 @@ def get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if token:
         return token
-
-    env_path = ".env"
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                if key.strip() == "TELEGRAM_BOT_TOKEN":
-                    cleaned = value.strip().strip('"').strip("'")
-                    if cleaned:
-                        return cleaned
-
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment or .env file.")
 
 
 def get_url_text(url: str, headers: dict[str, str] | None = None) -> str:
     req_headers = headers or REQUEST_HEADERS_GENERIC
-    try:
-        response = requests.get(url, headers=req_headers, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.SSLError:
-        response = requests.get(url, headers=req_headers, timeout=30, verify=False)
-        response.raise_for_status()
-        return response.text
+    response = requests.get(url, headers=req_headers, timeout=30)
+    response.raise_for_status()
+    return response.text
 
 
 def get_url_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
     req_headers = headers or REQUEST_HEADERS_GENERIC
-    try:
-        response = requests.get(url, headers=req_headers, timeout=30)
-        response.raise_for_status()
-        return response.content
-    except requests.exceptions.SSLError:
-        response = requests.get(url, headers=req_headers, timeout=30, verify=False)
-        response.raise_for_status()
-        return response.content
+    response = requests.get(url, headers=req_headers, timeout=30)
+    response.raise_for_status()
+    return response.content
 
 
 def strip_html(text: str) -> str:
@@ -327,7 +312,7 @@ def strip_html(text: str) -> str:
 
 
 def normalize_text(text: str) -> str:
-    return re.sub(r"\\s+", " ", strip_html(text)).strip()
+    return re.sub(r"\s+", " ", strip_html(text)).strip()
 
 
 def col_from_ref(cell_ref: str) -> str:
@@ -789,8 +774,8 @@ def normalize_category(value: str) -> str:
 def parse_ai_news_items(text: str) -> list[dict[str, str]]:
     payload = text.strip()
     if payload.startswith("```"):
-        payload = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", payload)
-        payload = re.sub(r"\\n?```$", "", payload).strip()
+        payload = re.sub(r"^```[a-zA-Z0-9]*\n?", "", payload)
+        payload = re.sub(r"\n?```$", "", payload).strip()
     parsed = json.loads(payload)
     items = parsed.get("items", [])
     if not isinstance(items, list):
@@ -922,8 +907,8 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
 def parse_json_payload(text: str) -> object:
     payload = text.strip()
     if payload.startswith("```"):
-        payload = re.sub(r"^```[a-zA-Z0-9]*\\n?", "", payload)
-        payload = re.sub(r"\\n?```$", "", payload).strip()
+        payload = re.sub(r"^```[a-zA-Z0-9]*\n?", "", payload)
+        payload = re.sub(r"\n?```$", "", payload).strip()
     return json.loads(payload)
 
 
@@ -1233,24 +1218,13 @@ def build_news_block(
             "updated_at": now_ts,
         }
         return content
-    except NewsFetchError as exc:
+    except Exception as exc:
         lines = [f"News AI: fallback ({exc})"]
-        if debug_mode and exc.debug_logs:
+        if isinstance(exc, NewsFetchError) and debug_mode and exc.debug_logs:
             lines.append("")
             lines.append("News service (debug):")
             for log in exc.debug_logs:
                 lines.append(f"- {log}")
-        lines.append("")
-        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
-        content = "\n".join(lines)
-        NEWS_CACHE[cache_key] = {
-            "content": content,
-            "expires_at": now_ts + max(fallback_ttl, 30),
-            "updated_at": now_ts,
-        }
-        return content
-    except Exception as exc:
-        lines = [f"News AI: fallback ({exc})"]
         lines.append("")
         lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
         content = "\n".join(lines)
@@ -1268,6 +1242,9 @@ def build_fear_greed_block() -> str:
     prev_fg_dict = prev_fg if isinstance(prev_fg, dict) else {}
     next_fg: dict[str, object] = dict(prev_fg_dict)
     state_dirty = False
+
+    score: float | None = None
+    c_score: int | None = None
 
     try:
         score, rating, updated_at = fetch_fear_and_greed()
@@ -1292,7 +1269,7 @@ def build_fear_greed_block() -> str:
     try:
         if "stock_score" in prev_fg_dict:
             prev_stock_score = float(prev_fg_dict["stock_score"])
-            icon = trend_icon(score, prev_stock_score) if "score" in locals() else "⚫"
+            icon = trend_icon(score, prev_stock_score) if score is not None else "⚫"
             stock_prev = (
                 f"[{prev_stock_score:.2f} "
                 f"{str(prev_fg_dict.get('stock_rating', 'n/a'))} "
@@ -1306,7 +1283,7 @@ def build_fear_greed_block() -> str:
     try:
         if "crypto_score" in prev_fg_dict:
             prev_crypto_score = int(float(prev_fg_dict["crypto_score"]))
-            icon = trend_icon(float(c_score), float(prev_crypto_score)) if "c_score" in locals() else "⚫"
+            icon = trend_icon(float(c_score), float(prev_crypto_score)) if c_score is not None else "⚫"
             crypto_prev = (
                 "["
                 f"{prev_crypto_score} "
@@ -1391,6 +1368,8 @@ def get_target_chat_id() -> int | None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
     await update.message.reply_text(
         with_version(
             "Привет! Я показываю Fear & Greed Index.\n"
@@ -1408,26 +1387,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def fg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, html_mode = render_block("fg", include_version=True)
+    if not _check_access(update):
+        return
+    text, html_mode = await render_block_async(block_name="fg", include_version=True)
     await send_rendered_update(update, text, html_mode)
 
 
 async def fx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, html_mode = render_block("fx", include_version=True)
+    if not _check_access(update):
+        return
+    text, html_mode = await render_block_async(block_name="fx", include_version=True)
     await send_rendered_update(update, text, html_mode)
 
 
 async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, html_mode = render_block("st", include_version=True)
+    if not _check_access(update):
+        return
+    text, html_mode = await render_block_async(block_name="st", include_version=True)
     await send_rendered_update(update, text, html_mode)
 
 
 async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, html_mode = render_block("dam", include_version=True)
+    if not _check_access(update):
+        return
+    text, html_mode = await render_block_async(block_name="dam", include_version=True)
     await send_rendered_update(update, text, html_mode)
 
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
     force_refresh = False
     debug_mode = False
     if context.args:
@@ -1436,8 +1425,8 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         debug_mode = first in {"debug", "dbg", "trace"}
     if debug_mode:
         force_refresh = True
-    text, html_mode = render_block(
-        "news",
+    text, html_mode = await render_block_async(
+        block_name="news",
         include_version=True,
         force_refresh=force_refresh,
         debug_mode=debug_mode,
@@ -1447,10 +1436,12 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
     block_order = ["fg", "st", "fx", "dam", "news"]
     for idx, block_name in enumerate(block_order):
-        text, html_mode = render_block(
-            block_name,
+        text, html_mode = await render_block_async(
+            block_name=block_name,
             include_version=(idx == 0),
             news_spoilers=True,
         )
@@ -1458,6 +1449,8 @@ async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -1483,8 +1476,8 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
     block_order = ["fg", "st", "fx", "dam", "news"]
     for idx, block_name in enumerate(block_order):
-        text, html_mode = render_block(
-            block_name,
+        text, html_mode = await render_block_async(
+            block_name=block_name,
             include_version=(idx == 0),
             news_spoilers=True,
         )
@@ -1541,8 +1534,20 @@ async def on_startup(app) -> None:
             pass
 
 
+def _check_access(update: Update) -> bool:
+    if ALLOWED_USER_ID is None:
+        return True
+    user = update.effective_user
+    return user is not None and user.id == ALLOWED_USER_ID
+
+
 def main() -> None:
+    global ALLOWED_USER_ID
+    load_dotenv()
     token = get_token()
+    raw_uid = os.getenv("ALLOWED_USER_ID", "").strip()
+    if raw_uid:
+        ALLOWED_USER_ID = int(raw_uid)
 
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
