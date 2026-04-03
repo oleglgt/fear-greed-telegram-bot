@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import io
 import json
@@ -16,8 +17,8 @@ import xml.etree.ElementTree as ET
 
 import requests
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
@@ -37,7 +38,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v1.13.0"
+BOT_VERSION = "v2.0.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -79,6 +80,54 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
         "https://www.marketwatch.com/rss/topstories",
         "https://feeds.reuters.com/reuters/businessNews",
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    ],
+}
+
+# ── Digest V2 ────────────────────────────────────────────────────────────────
+DIGEST_SOURCE_RATINGS_FILE = "source_ratings.json"
+DIGEST_SENT_FILE = "sent_digests.json"
+DIGEST_SENT_HOURS = 72
+DIGEST_TARGET_COUNT = 12
+DIGEST_NEW_SOURCE_RATIO = 0.33
+DIGEST_MAX_AGE_HOURS = 48
+DIGEST_REACTION_MAP: dict[str, str] = {}  # hash → source name (in-memory)
+DIGEST_REACTION_DELTAS = {"fire": 10, "like": 5, "dislike": -3, "poop": -5}
+DIGEST_CATEGORY_ICONS = {
+    "ai": "🤖", "robotics": "🦾", "evtol": "✈️", "vibecoding": "🛠️",
+    "tech": "⚡", "business": "💼", "investments": "💰", "other": "📰",
+}
+DIGEST_RSS_FEEDS: dict[str, list[str]] = {
+    "ai": [
+        "https://techcrunch.com/category/artificial-intelligence/feed/",
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+        "https://feeds.arstechnica.com/arstechnica/technology-lab",
+        "https://venturebeat.com/category/ai/feed/",
+        "https://news.mit.edu/rss/topic/artificial-intelligence2",
+    ],
+    "robotics": [
+        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
+        "https://techcrunch.com/category/robotics/feed/",
+        "https://www.therobotreport.com/feed/",
+    ],
+    "evtol": [
+        "https://evtolinsights.com/feed/",
+    ],
+    "vibecoding": [
+        "https://hnrss.org/newest?q=AI+coding+OR+copilot+OR+cursor+OR+claude",
+        "https://dev.to/feed/tag/ai",
+        "https://simonwillison.net/atom/everything/",
+    ],
+    "tech": [
+        "https://techcrunch.com/feed/",
+        "https://www.theverge.com/rss/index.xml",
+        "https://feeds.arstechnica.com/arstechnica/index",
+    ],
+    "business": [
+        "https://feeds.reuters.com/reuters/businessNews",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    ],
+    "investments": [
+        "https://www.marketwatch.com/rss/topstories",
     ],
 }
 
@@ -1236,6 +1285,246 @@ def build_news_block(
         return content
 
 
+# ── Digest V2: source ratings ────────────────────────────────────────────────
+
+
+def load_source_ratings() -> dict[str, dict]:
+    try:
+        with open(DIGEST_SOURCE_RATINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_source_ratings(ratings: dict[str, dict]) -> None:
+    with open(DIGEST_SOURCE_RATINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ratings, f, ensure_ascii=False, indent=2)
+
+
+def get_source_rating_score(ratings: dict, source: str) -> float:
+    entry = ratings.get(source.lower().strip(), {})
+    return float(entry.get("score", 0))
+
+
+def is_proven_source(ratings: dict, source: str) -> bool:
+    entry = ratings.get(source.lower().strip(), {})
+    return int(entry.get("count", 0)) >= 3
+
+
+def update_source_rating(source: str, delta: float) -> None:
+    ratings = load_source_ratings()
+    key = source.lower().strip()
+    entry = ratings.get(key, {"score": 0, "count": 0})
+    entry["score"] = float(entry.get("score", 0)) + delta
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    ratings[key] = entry
+    save_source_ratings(ratings)
+
+
+def source_hash(source: str) -> str:
+    return hashlib.md5(source.lower().strip().encode()).hexdigest()[:12]
+
+
+# ── Digest V2: sent history ─────────────────────────────────────────────────
+
+
+def load_sent_digests() -> list[dict]:
+    try:
+        with open(DIGEST_SENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_sent_digests(digests: list[dict]) -> None:
+    with open(DIGEST_SENT_FILE, "w", encoding="utf-8") as f:
+        json.dump(digests, f, ensure_ascii=False)
+
+
+def prune_sent_digests(digests: list[dict], now_ts: float) -> list[dict]:
+    cutoff = now_ts - DIGEST_SENT_HOURS * 3600
+    return [d for d in digests if float(d.get("sent_at", 0)) >= cutoff]
+
+
+def is_already_sent(digests: list[dict], fingerprint: str) -> bool:
+    return any(d.get("fingerprint") == fingerprint for d in digests)
+
+
+# ── Digest V2: AI scoring ───────────────────────────────────────────────────
+
+
+def score_digest_items_via_ai(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        for item in items:
+            item["ai_score"] = "0"
+        return items
+
+    payload = [
+        {
+            "id": i,
+            "title": item.get("headline_en", "")[:120],
+            "source": item.get("source", ""),
+            "published_at": item.get("published_at", ""),
+            "summary": item.get("details_en", "")[:200],
+        }
+        for i, item in enumerate(items)
+    ]
+
+    # Process in batches of 25 to stay within token limits.
+    batch_size = 25
+    for start in range(0, len(payload), batch_size):
+        batch = payload[start : start + batch_size]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a tech news curator. Score each item 0-100.\n\n"
+                    "Scoring:\n"
+                    "- Event importance (0-40): 35-40 breakthroughs/major, 25-34 significant, "
+                    "15-24 trends, 5-14 minor\n"
+                    "- Topic priority (0-30): AI=30, Robotics=25, eVTOL=20, "
+                    "Vibe coding tools=15, Tech=10, Business=5, Investments=3, Other=1\n"
+                    "- Source quality (0-20): Top tier=20, Good=15, Average=10, Unknown=5\n"
+                    "- Freshness (0-10): <6h=10, 6-24h=7, 24-48h=3\n\n"
+                    "Return strict JSON only:\n"
+                    '{"items":[{"id":0,"score":85,"category":"ai",'
+                    '"headline_ru":"заголовок","details_ru":"описание 2-3 предложения"}]}\n\n'
+                    "Categories: ai, robotics, evtol, vibecoding, tech, business, "
+                    "investments, other\n"
+                    "headline_ru and details_ru must be in Russian."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"items": batch}, ensure_ascii=False),
+            },
+        ]
+        try:
+            text = call_openai_chat(
+                messages, temperature=0.1, stage_label=f"digest scoring batch {start // batch_size + 1}"
+            )
+            result = parse_json_payload(text)
+            if not isinstance(result, dict):
+                continue
+            scored = result.get("items", [])
+            if not isinstance(scored, list):
+                continue
+            for s in scored:
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    idx = int(s["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if idx < 0 or idx >= len(items):
+                    continue
+                items[idx]["ai_score"] = str(float(s.get("score", 0)))
+                items[idx]["ai_category"] = str(s.get("category", items[idx].get("category", "other")))
+                headline_ru = normalize_text(str(s.get("headline_ru", "")))
+                details_ru = normalize_text(str(s.get("details_ru", "")))
+                if headline_ru:
+                    items[idx]["headline_ru"] = headline_ru
+                if details_ru:
+                    items[idx]["details_ru"] = details_ru
+        except Exception:
+            continue
+
+    return items
+
+
+# ── Digest V2: selection ─────────────────────────────────────────────────────
+
+
+def select_digest_items(
+    items: list[dict[str, str]], source_ratings: dict
+) -> list[dict[str, str]]:
+    target = DIGEST_TARGET_COUNT
+
+    proven = [i for i in items if is_proven_source(source_ratings, i.get("source", ""))]
+    new = [i for i in items if not is_proven_source(source_ratings, i.get("source", ""))]
+
+    proven.sort(key=lambda x: float(x.get("ai_score", "0")), reverse=True)
+    new.sort(key=lambda x: float(x.get("ai_score", "0")), reverse=True)
+
+    new_count = max(1, int(target * DIGEST_NEW_SOURCE_RATIO))
+    proven_count = target - new_count
+
+    selected = proven[:proven_count] + new[:new_count]
+
+    if len(selected) < target:
+        remaining = proven[proven_count:] + new[new_count:]
+        remaining.sort(key=lambda x: float(x.get("ai_score", "0")), reverse=True)
+        selected.extend(remaining[: target - len(selected)])
+
+    selected.sort(key=lambda x: float(x.get("ai_score", "0")), reverse=True)
+    return selected[:target]
+
+
+# ── Digest V2: build ─────────────────────────────────────────────────────────
+
+
+def build_digest_v2() -> tuple[list[dict[str, str]], str]:
+    now_utc = datetime.now(timezone.utc)
+    cutoff_ts = now_utc.timestamp() - DIGEST_MAX_AGE_HOURS * 3600
+
+    source_ratings = load_source_ratings()
+    sent_digests = prune_sent_digests(load_sent_digests(), now_utc.timestamp())
+
+    all_items: list[dict[str, str]] = []
+    seen_fps: set[str] = set()
+
+    for category, feeds in DIGEST_RSS_FEEDS.items():
+        for feed_url in feeds:
+            try:
+                xml_text = get_url_text(feed_url)
+                feed_items = parse_news_feed_items(xml_text, category)
+                for item in feed_items:
+                    pub_raw = item.pop("_published_dt", "")
+                    pub_dt = parse_feed_datetime(pub_raw)
+                    if not pub_dt or pub_dt.timestamp() < cutoff_ts:
+                        continue
+                    fp = news_item_fingerprint(item)
+                    if fp in seen_fps or is_already_sent(sent_digests, fp):
+                        continue
+                    seen_fps.add(fp)
+                    # Skip sources with very negative rating.
+                    src = item.get("source", "")
+                    if get_source_rating_score(source_ratings, src) < -5:
+                        continue
+                    all_items.append(item)
+            except Exception:
+                continue
+
+    if not all_items:
+        return [], "Нет свежих новостей за последние 48ч."
+
+    all_items = score_digest_items_via_ai(all_items)
+
+    # Add source rating bonus to AI score.
+    for item in all_items:
+        bonus = max(-5.0, min(get_source_rating_score(source_ratings, item.get("source", "")), 10.0))
+        item["ai_score"] = str(float(item.get("ai_score", "0")) + bonus)
+
+    selected = select_digest_items(all_items, source_ratings)
+
+    # Record sent fingerprints.
+    for item in selected:
+        fp = news_item_fingerprint(item)
+        sent_digests.append({"fingerprint": fp, "sent_at": now_utc.timestamp()})
+    save_sent_digests(sent_digests)
+
+    # Populate reaction map (hash → source) for callback handler.
+    for item in selected:
+        src = item.get("source", "")
+        DIGEST_REACTION_MAP[source_hash(src)] = src
+
+    return selected, ""
+
+
 def build_fear_greed_block() -> str:
     state = load_bot_state()
     prev_fg = state.get("fg")
@@ -1378,7 +1667,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/st - Bitcoin и S&P\n"
             "/fx - валюты\n"
             "/dam - Cyprus reservoirs\n"
-            "/news - новостной дайджест\n"
+            "/news - новостной дайджест (v1)\n"
+            "/digest - tech-дайджест с ИИ-скорингом\n"
             "/all - все блоки\n\n"
             "Авто-отправка в 08:00 и 20:00 (Кипр) отправляет /all, если в Render задана "
             "переменная TELEGRAM_TARGET_CHAT_ID."
@@ -1484,6 +1774,90 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_rendered_chat(context, chat_id, text, html_mode)
 
 
+async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
+    msg = await update.effective_message.reply_text("⏳ Собираю дайджест...")
+
+    loop = asyncio.get_running_loop()
+    selected, error = await loop.run_in_executor(None, build_digest_v2)
+
+    if error:
+        await msg.edit_text(with_version(error))
+        return
+
+    await msg.delete()
+
+    for item in selected:
+        cat = item.get("ai_category", item.get("category", "other"))
+        icon = DIGEST_CATEGORY_ICONS.get(cat, "📰")
+        headline = item.get("headline_ru", item.get("headline_en", ""))
+        details = item.get("details_ru", item.get("details_en", ""))
+        source = item.get("source", "")
+        url = item.get("url", "")
+        score_val = int(float(item.get("ai_score", "0")))
+
+        text = f"{icon} <b>{html_escape(headline)}</b>\n"
+        if details:
+            text += f"<blockquote expandable>{html_escape(details)}</blockquote>\n"
+        text += f"📊 {score_val} | {html_escape(source)}\n"
+        if url:
+            text += f'<a href="{html_escape(url, quote=True)}">Читать →</a>'
+
+        src_h = source_hash(source)
+        DIGEST_REACTION_MAP[src_h] = source
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔥", callback_data=f"dr:fire:{src_h}"),
+                    InlineKeyboardButton("👍", callback_data=f"dr:like:{src_h}"),
+                    InlineKeyboardButton("👎", callback_data=f"dr:dislike:{src_h}"),
+                    InlineKeyboardButton("💩", callback_data=f"dr:poop:{src_h}"),
+                ]
+            ]
+        )
+
+        await update.effective_message.reply_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+
+    await update.effective_message.reply_text(
+        with_version(
+            f"Дайджест: {len(selected)} новостей | "
+            f"{format_cyprus_time(datetime.now(timezone.utc))}"
+        )
+    )
+
+
+async def digest_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not _check_access(update):
+        await query.answer("⛔")
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[0] != "dr":
+        return
+
+    reaction = parts[1]
+    src_h = parts[2]
+    delta = DIGEST_REACTION_DELTAS.get(reaction)
+    if delta is None:
+        await query.answer("?")
+        return
+
+    source_name = DIGEST_REACTION_MAP.get(src_h, src_h)
+    update_source_rating(source_name, delta)
+
+    icons = {"fire": "🔥", "like": "👍", "dislike": "👎", "poop": "💩"}
+    await query.answer(f"{icons.get(reaction, '✓')} {source_name}")
+
+
 async def on_startup(app) -> None:
     global SCHEDULER_STATUS
     await app.bot.set_my_commands(
@@ -1493,7 +1867,8 @@ async def on_startup(app) -> None:
             BotCommand("st", "Bitcoin и S&P"),
             BotCommand("fx", "валюты"),
             BotCommand("dam", "Cyprus reservoirs"),
-            BotCommand("news", "новостной дайджест"),
+            BotCommand("news", "новостной дайджест (v1)"),
+            BotCommand("digest", "tech-дайджест с ИИ-скорингом"),
             BotCommand("all", "все блоки"),
             BotCommand("status", "статус scheduler и env"),
         ]
@@ -1556,8 +1931,10 @@ def main() -> None:
     app.add_handler(CommandHandler("fx", fx))
     app.add_handler(CommandHandler("dam", dam))
     app.add_handler(CommandHandler("news", news))
+    app.add_handler(CommandHandler("digest", digest_cmd))
     app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(digest_reaction_callback, pattern=r"^dr:"))
 
     app.run_polling()
 
