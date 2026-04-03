@@ -38,7 +38,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.0.0"
+BOT_VERSION = "v2.1.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -1327,6 +1327,58 @@ def source_hash(source: str) -> str:
     return hashlib.md5(source.lower().strip().encode()).hexdigest()[:12]
 
 
+DIGEST_BACKUP_CAPTION = "#digest_ratings_backup"
+
+
+async def restore_ratings_from_telegram(bot) -> bool:
+    """Download source_ratings.json from pinned message on startup."""
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        return False
+    try:
+        chat = await bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return False
+        if not pinned.caption or DIGEST_BACKUP_CAPTION not in pinned.caption:
+            return False
+        tg_file = await bot.get_file(pinned.document.file_id)
+        raw = await tg_file.download_as_bytearray()
+        data = json.loads(raw.decode("utf-8"))
+        if isinstance(data, dict):
+            save_source_ratings(data)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def backup_ratings_to_telegram(bot) -> None:
+    """Upload source_ratings.json as pinned document."""
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        return
+    ratings = load_source_ratings()
+    if not ratings:
+        return
+    try:
+        content = json.dumps(ratings, ensure_ascii=False, indent=2).encode("utf-8")
+        doc = io.BytesIO(content)
+        doc.name = "source_ratings.json"
+        msg = await bot.send_document(
+            chat_id=chat_id,
+            document=doc,
+            caption=DIGEST_BACKUP_CAPTION,
+        )
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        pass
+
+
 # ── Digest V2: sent history ─────────────────────────────────────────────────
 
 
@@ -1857,9 +1909,18 @@ async def digest_reaction_callback(update: Update, context: ContextTypes.DEFAULT
     icons = {"fire": "🔥", "like": "👍", "dislike": "👎", "poop": "💩"}
     await query.answer(f"{icons.get(reaction, '✓')} {source_name}")
 
+    # Backup ratings to Telegram so they survive redeploys.
+    await backup_ratings_to_telegram(context.bot)
+
 
 async def on_startup(app) -> None:
     global SCHEDULER_STATUS
+    # Restore source ratings from Telegram backup.
+    restored = await restore_ratings_from_telegram(app.bot)
+    if restored:
+        ratings = load_source_ratings()
+        count = len(ratings)
+        print(f"[digest] Restored {count} source ratings from Telegram backup")
     await app.bot.set_my_commands(
         [
             BotCommand("start", "помощь"),
