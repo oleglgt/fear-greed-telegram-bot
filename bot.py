@@ -544,7 +544,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
             elif symbol == "ES=F" and price is not None:
                 es_price = float(price)
         # Show futures when the stock market is not in regular session.
-        if es_price is not None and spx_market_state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"):
+        if es_price is not None and spx_market_state != "REGULAR":
             spx_premarket = es_price
     except Exception:
         pass
