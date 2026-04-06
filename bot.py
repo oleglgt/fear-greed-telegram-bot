@@ -1677,10 +1677,11 @@ def build_st_block() -> str:
         btc_price, spx_price, spx_premarket = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
+        premarket_line = ""
         if spx_premarket is not None:
             pct = (spx_premarket - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
-            spx_line += f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
+            premarket_line = f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
@@ -1706,7 +1707,7 @@ def build_st_block() -> str:
                 )
         except Exception:
             pass
-        return f"{btc_line}\n{spx_line}"
+        return f"{btc_line}\n{spx_line}{premarket_line}"
     except Exception as exc:
         return f"Рыночные цены: временно недоступны ({exc})"
 
