@@ -27,7 +27,6 @@ YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
-STOOQ_ES_CSV_URL = "https://stooq.com/q/l/?s=@es.f&i=1"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -522,10 +521,9 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     spx_price: float | None = None
     spx_premarket: float | None = None
 
-    # Primary source: Yahoo Finance (both symbols in one call).
-    spx_market_state = ""
+    # Primary source: Yahoo Finance. SPY is used for extended-hours data.
     try:
-        params = {"symbols": "BTC-USD,^GSPC"}
+        params = {"symbols": "BTC-USD,^GSPC,SPY"}
         response = requests.get(
             YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
         )
@@ -540,20 +538,20 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
                 btc_price = float(price)
             elif symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
-                spx_market_state = item.get("marketState", "")
-        logger.info("Yahoo ^GSPC marketState=%s", spx_market_state)
+            elif symbol == "SPY":
+                market_state = item.get("marketState", "")
+                logger.info("SPY marketState=%s, preMarketPrice=%s, postMarketPrice=%s",
+                            market_state, item.get("preMarketPrice"), item.get("postMarketPrice"))
+                extended_price = None
+                if market_state in ("PRE", "PREPRE"):
+                    extended_price = item.get("preMarketPrice")
+                elif market_state in ("POST", "POSTPOST"):
+                    extended_price = item.get("postMarketPrice")
+                if extended_price is not None:
+                    # Scale SPY price to S&P 500 level (SPY ≈ 1/10 of S&P 500).
+                    spx_premarket = float(extended_price) * 10
     except Exception as exc:
-        logger.warning("Yahoo BTC/^GSPC request failed: %s", exc)
-
-    # E-mini S&P 500 futures via Stooq.
-    try:
-        es_resp = requests.get(STOOQ_ES_CSV_URL, timeout=15)
-        es_resp.raise_for_status()
-        es_price, _ = parse_stooq_csv_line(es_resp.text)
-        spx_premarket = es_price
-        logger.info("Stooq ES futures price=%.2f", es_price)
-    except Exception as exc:
-        logger.warning("Stooq ES futures request failed: %s", exc)
+        logger.warning("Yahoo request failed: %s", exc)
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
@@ -1668,7 +1666,7 @@ def build_st_block() -> str:
         if spx_premarket is not None:
             pct = (spx_premarket - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
-            spx_line += f"\nS&P 500 Futures (ES=F): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
+            spx_line += f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
