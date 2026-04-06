@@ -23,7 +23,7 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
-YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
@@ -521,10 +521,10 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
     spx_price: float | None = None
     spx_premarket: float | None = None
 
-    # Primary source: Yahoo Finance. SPY is used for extended-hours data.
+    # Primary source: Yahoo Finance for BTC and S&P.
     _spy_debug = ""
     try:
-        params = {"symbols": "BTC-USD,^GSPC,SPY"}
+        params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
             YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
         )
@@ -532,7 +532,6 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
-        _spy_debug = f"symbols={[r.get('symbol') for r in results]}"
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
@@ -540,22 +539,37 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
                 btc_price = float(price)
             elif symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
-            elif symbol == "SPY":
-                market_state = item.get("marketState", "")
-                pre_p = item.get("preMarketPrice")
-                post_p = item.get("postMarketPrice")
-                _spy_debug = (f"SPY state={market_state} pre={pre_p} post={post_p} "
-                              f"reg={price}")
-                extended_price = None
-                if market_state in ("PRE", "PREPRE"):
-                    extended_price = pre_p
-                elif market_state in ("POST", "POSTPOST"):
-                    extended_price = post_p
-                if extended_price is not None:
-                    # Scale SPY price to S&P 500 level (SPY ≈ 1/10 of S&P 500).
-                    spx_premarket = float(extended_price) * 10
+    except Exception:
+        pass
+
+    # SPY extended-hours via Yahoo (separate request to reduce 429 impact).
+    try:
+        spy_resp = requests.get(
+            YAHOO_QUOTE_URL, params={"symbols": "SPY"},
+            headers=REQUEST_HEADERS_GENERIC, timeout=15
+        )
+        spy_resp.raise_for_status()
+        spy_data = spy_resp.json()
+        spy_results = spy_data.get("quoteResponse", {}).get("result", [])
+        if spy_results:
+            item = spy_results[0]
+            market_state = item.get("marketState", "")
+            pre_p = item.get("preMarketPrice")
+            post_p = item.get("postMarketPrice")
+            reg_p = item.get("regularMarketPrice")
+            _spy_debug = (f"SPY state={market_state} pre={pre_p} post={post_p} "
+                          f"reg={reg_p}")
+            extended_price = None
+            if market_state in ("PRE", "PREPRE"):
+                extended_price = pre_p
+            elif market_state in ("POST", "POSTPOST"):
+                extended_price = post_p
+            if extended_price is not None:
+                spx_premarket = float(extended_price) * 10
+        else:
+            _spy_debug = "SPY: empty result"
     except Exception as exc:
-        _spy_debug = f"ERR: {exc}"
+        _spy_debug = f"SPY ERR: {exc}"
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
