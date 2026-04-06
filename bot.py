@@ -521,8 +521,9 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     spx_premarket: float | None = None
 
     # Primary source: Yahoo Finance (both symbols in one call).
+    # ES=F (E-mini S&P 500 futures) is used for pre-market indication.
     try:
-        params = {"symbols": "BTC-USD,^GSPC"}
+        params = {"symbols": "BTC-USD,^GSPC,ES=F"}
         response = requests.get(
             YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
         )
@@ -530,6 +531,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
+        spx_market_state = ""
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
@@ -537,10 +539,11 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
                 btc_price = float(price)
             if symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
-                market_state = item.get("marketState", "")
-                pre_price = item.get("preMarketPrice")
-                if market_state in ("PRE", "PREPRE") and pre_price is not None:
-                    spx_premarket = float(pre_price)
+                spx_market_state = item.get("marketState", "")
+            if symbol == "ES=F" and price is not None:
+                # Show futures price as pre-market when the stock market is not open.
+                if spx_market_state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"):
+                    spx_premarket = float(price)
     except Exception:
         pass
 
@@ -1657,7 +1660,7 @@ def build_st_block() -> str:
         if spx_premarket is not None:
             pct = (spx_premarket - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
-            spx_line += f"\nS&P 500 Pre-Market: {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
+            spx_line += f"\nS&P 500 Futures (ES=F): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
