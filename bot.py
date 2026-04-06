@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import hashlib
 import os
 import io
@@ -513,8 +512,8 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     return score, rating, updated_at
 
 
-def fetch_market_prices() -> tuple[float, float, float | None, str]:
-    """Return (btc_price, spx_price, spx_premarket_price_or_None, debug)."""
+def fetch_market_prices() -> tuple[float, float, float | None]:
+    """Return (btc_price, spx_price, spx_premarket_price_or_None)."""
     global LAST_BTC_PRICE, LAST_SPX_PRICE
 
     btc_price: float | None = None
@@ -522,7 +521,6 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
     spx_premarket: float | None = None
 
     # Primary source: Yahoo Finance for BTC and S&P.
-    _spy_debug = ""
     try:
         params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
@@ -562,17 +560,12 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
         quote = spy_data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
         if quote:
             q = quote[0]
-            last_str = q.get("last", "")
             ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
-            _spy_debug = (f"CNBC last={last_str} ext={ext_last_str} "
-                          f"keys={list(q.get('ExtendedMktQuote', {}).keys())}")
             if ext_last_str:
                 ext_price = float(ext_last_str.replace(",", ""))
                 spx_premarket = ext_price * 10
-        else:
-            _spy_debug = "CNBC: empty quote"
-    except Exception as exc:
-        _spy_debug = f"CNBC ERR: {exc}"
+    except Exception:
+        pass
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
@@ -637,7 +630,7 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
     LAST_BTC_PRICE = btc_price
     LAST_SPX_PRICE = spx_price
 
-    return btc_price, spx_price, spx_premarket, _spy_debug
+    return btc_price, spx_price, spx_premarket
 
 
 def fetch_fx_yahoo() -> tuple[float, float, str]:
@@ -1681,14 +1674,13 @@ def build_st_block() -> str:
     prev_st = state.get("st")
     prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
-        btc_price, spx_price, spx_premarket, spy_debug = fetch_market_prices()
+        btc_price, spx_price, spx_premarket = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
         if spx_premarket is not None:
             pct = (spx_premarket - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
             spx_line += f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
-        spx_line += f"\n[debug] {spy_debug}"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
@@ -2014,13 +2006,9 @@ def _check_access(update: Update) -> bool:
     return user is not None and user.id == ALLOWED_USER_ID
 
 
-logger = logging.getLogger(__name__)
-
-
 def main() -> None:
     global ALLOWED_USER_ID
     load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     token = get_token()
     raw_uid = os.getenv("ALLOWED_USER_ID", "").strip()
     if raw_uid:
