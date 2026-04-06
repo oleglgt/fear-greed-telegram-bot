@@ -531,19 +531,21 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
+        es_price: float | None = None
         spx_market_state = ""
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
             if symbol == "BTC-USD" and price is not None:
                 btc_price = float(price)
-            if symbol == "^GSPC" and price is not None:
+            elif symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
                 spx_market_state = item.get("marketState", "")
-            if symbol == "ES=F" and price is not None:
-                # Show futures price as pre-market when the stock market is not open.
-                if spx_market_state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"):
-                    spx_premarket = float(price)
+            elif symbol == "ES=F" and price is not None:
+                es_price = float(price)
+        # Show futures when the stock market is not in regular session.
+        if es_price is not None and spx_market_state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"):
+            spx_premarket = es_price
     except Exception:
         pass
 
