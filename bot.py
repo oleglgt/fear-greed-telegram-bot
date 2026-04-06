@@ -27,6 +27,7 @@ YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
+STOOQ_ES_CSV_URL = "https://stooq.com/q/l/?s=@es.f&i=1"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -39,7 +40,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.1.1"
+BOT_VERSION = "v2.2.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -544,26 +545,15 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     except Exception as exc:
         logger.warning("Yahoo BTC/^GSPC request failed: %s", exc)
 
-    # ES=F (E-mini S&P 500 futures) — always fetch.
+    # E-mini S&P 500 futures via Stooq.
     try:
-        params = {"symbols": "ES=F"}
-        es_resp = requests.get(
-            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
-        )
+        es_resp = requests.get(STOOQ_ES_CSV_URL, timeout=15)
         es_resp.raise_for_status()
-        es_data = es_resp.json()
-        es_results = es_data.get("quoteResponse", {}).get("result", [])
-        logger.info("Yahoo ES=F result count=%d, symbols=%s",
-                    len(es_results), [r.get("symbol") for r in es_results])
-        for item in es_results:
-            price = item.get("regularMarketPrice")
-            logger.info("ES=F item: symbol=%s regularMarketPrice=%s keys=%s",
-                        item.get("symbol"), price, list(item.keys())[:10])
-            if price is not None:
-                spx_premarket = float(price)
-                break
+        es_price, _ = parse_stooq_csv_line(es_resp.text)
+        spx_premarket = es_price
+        logger.info("Stooq ES futures price=%.2f", es_price)
     except Exception as exc:
-        logger.warning("Yahoo ES=F request failed: %s", exc)
+        logger.warning("Stooq ES futures request failed: %s", exc)
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
