@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import hashlib
 import os
 import io
@@ -521,9 +522,9 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     spx_premarket: float | None = None
 
     # Primary source: Yahoo Finance (both symbols in one call).
-    # ES=F (E-mini S&P 500 futures) is used for pre-market indication.
+    spx_market_state = ""
     try:
-        params = {"symbols": "BTC-USD,^GSPC,ES=F"}
+        params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
             YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
         )
@@ -531,8 +532,6 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
-        es_price: float | None = None
-        spx_market_state = ""
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
@@ -541,13 +540,30 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
             elif symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
                 spx_market_state = item.get("marketState", "")
-            elif symbol == "ES=F" and price is not None:
-                es_price = float(price)
-        # Show futures when the stock market is not in regular session.
-        if es_price is not None and spx_market_state != "REGULAR":
-            spx_premarket = es_price
-    except Exception:
-        pass
+        logger.info("Yahoo ^GSPC marketState=%s", spx_market_state)
+    except Exception as exc:
+        logger.warning("Yahoo BTC/^GSPC request failed: %s", exc)
+
+    # ES=F (E-mini S&P 500 futures) — always fetch.
+    try:
+        params = {"symbols": "ES=F"}
+        es_resp = requests.get(
+            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
+        )
+        es_resp.raise_for_status()
+        es_data = es_resp.json()
+        es_results = es_data.get("quoteResponse", {}).get("result", [])
+        logger.info("Yahoo ES=F result count=%d, symbols=%s",
+                    len(es_results), [r.get("symbol") for r in es_results])
+        for item in es_results:
+            price = item.get("regularMarketPrice")
+            logger.info("ES=F item: symbol=%s regularMarketPrice=%s keys=%s",
+                        item.get("symbol"), price, list(item.keys())[:10])
+            if price is not None:
+                spx_premarket = float(price)
+                break
+    except Exception as exc:
+        logger.warning("Yahoo ES=F request failed: %s", exc)
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
@@ -1988,9 +2004,13 @@ def _check_access(update: Update) -> bool:
     return user is not None and user.id == ALLOWED_USER_ID
 
 
+logger = logging.getLogger(__name__)
+
+
 def main() -> None:
     global ALLOWED_USER_ID
     load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     token = get_token()
     raw_uid = os.getenv("ALLOWED_USER_ID", "").strip()
     if raw_uid:
