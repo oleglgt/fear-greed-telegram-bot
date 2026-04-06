@@ -542,34 +542,37 @@ def fetch_market_prices() -> tuple[float, float, float | None, str]:
     except Exception:
         pass
 
-    # SPY extended-hours via Yahoo v8 chart API (separate rate limits from v7).
+    # SPY extended-hours via CNBC quote API (Yahoo is rate-limited).
     try:
         spy_resp = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
-            params={"range": "1d", "interval": "1m", "includePrePost": "true"},
-            headers=REQUEST_HEADERS_GENERIC, timeout=15
+            "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol",
+            params={
+                "symbols": "SPY",
+                "requestMethod": "itv",
+                "noBody": "1",
+                "partnerId": "2",
+                "fund": "1",
+                "exthrs": "1",
+                "output": "json",
+            },
+            headers=REQUEST_HEADERS_GENERIC, timeout=15,
         )
         spy_resp.raise_for_status()
-        spy_meta = spy_resp.json()["chart"]["result"][0]["meta"]
-        market_state = spy_meta.get("currentTradingPeriod", {})
-        reg_price = spy_meta.get("regularMarketPrice")
-        chart_price = spy_meta.get("chartPreviousClose")
-        # currentPrice reflects the latest price including extended hours.
-        current_price = spy_meta.get("regularMarketPrice")
-        pre_p = spy_meta.get("preMarketPrice")
-        post_p = spy_meta.get("postMarketPrice")
-        mkt_state = spy_meta.get("marketState", "")
-        _spy_debug = (f"v8 state={mkt_state} pre={pre_p} post={post_p} "
-                      f"reg={reg_price} prevClose={chart_price}")
-        extended_price = None
-        if mkt_state in ("PRE", "PREPRE"):
-            extended_price = pre_p
-        elif mkt_state in ("POST", "POSTPOST"):
-            extended_price = post_p
-        if extended_price is not None:
-            spx_premarket = float(extended_price) * 10
+        spy_data = spy_resp.json()
+        quote = spy_data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+        if quote:
+            q = quote[0]
+            last_str = q.get("last", "")
+            ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
+            _spy_debug = (f"CNBC last={last_str} ext={ext_last_str} "
+                          f"keys={list(q.get('ExtendedMktQuote', {}).keys())}")
+            if ext_last_str:
+                ext_price = float(ext_last_str.replace(",", ""))
+                spx_premarket = ext_price * 10
+        else:
+            _spy_debug = "CNBC: empty quote"
     except Exception as exc:
-        _spy_debug = f"v8 ERR: {exc}"
+        _spy_debug = f"CNBC ERR: {exc}"
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
