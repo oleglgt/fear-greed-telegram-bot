@@ -512,11 +512,13 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     return score, rating, updated_at
 
 
-def fetch_market_prices() -> tuple[float, float]:
+def fetch_market_prices() -> tuple[float, float, float | None]:
+    """Return (btc_price, spx_price, spx_premarket_price_or_None)."""
     global LAST_BTC_PRICE, LAST_SPX_PRICE
 
     btc_price: float | None = None
     spx_price: float | None = None
+    spx_premarket: float | None = None
 
     # Primary source: Yahoo Finance (both symbols in one call).
     try:
@@ -535,6 +537,10 @@ def fetch_market_prices() -> tuple[float, float]:
                 btc_price = float(price)
             if symbol == "^GSPC" and price is not None:
                 spx_price = float(price)
+                market_state = item.get("marketState", "")
+                pre_price = item.get("preMarketPrice")
+                if market_state in ("PRE", "PREPRE") and pre_price is not None:
+                    spx_premarket = float(pre_price)
     except Exception:
         pass
 
@@ -601,7 +607,7 @@ def fetch_market_prices() -> tuple[float, float]:
     LAST_BTC_PRICE = btc_price
     LAST_SPX_PRICE = spx_price
 
-    return btc_price, spx_price
+    return btc_price, spx_price, spx_premarket
 
 
 def fetch_fx_yahoo() -> tuple[float, float, str]:
@@ -1645,9 +1651,13 @@ def build_st_block() -> str:
     prev_st = state.get("st")
     prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
-        btc_price, spx_price = fetch_market_prices()
+        btc_price, spx_price, spx_premarket = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
+        if spx_premarket is not None:
+            pct = (spx_premarket - spx_price) / spx_price * 100
+            sign = "+" if pct >= 0 else ""
+            spx_line += f"\nS&P 500 Pre-Market: {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
