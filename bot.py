@@ -513,8 +513,8 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     return score, rating, updated_at
 
 
-def fetch_market_prices() -> tuple[float, float, float | None]:
-    """Return (btc_price, spx_price, spx_premarket_price_or_None)."""
+def fetch_market_prices() -> tuple[float, float, float | None, str]:
+    """Return (btc_price, spx_price, spx_premarket_price_or_None, debug)."""
     global LAST_BTC_PRICE, LAST_SPX_PRICE
 
     btc_price: float | None = None
@@ -522,6 +522,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     spx_premarket: float | None = None
 
     # Primary source: Yahoo Finance. SPY is used for extended-hours data.
+    _spy_debug = ""
     try:
         params = {"symbols": "BTC-USD,^GSPC,SPY"}
         response = requests.get(
@@ -531,6 +532,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         data = response.json()
 
         results = data["quoteResponse"]["result"]
+        _spy_debug = f"symbols={[r.get('symbol') for r in results]}"
         for item in results:
             symbol = item.get("symbol")
             price = item.get("regularMarketPrice")
@@ -540,18 +542,20 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
                 spx_price = float(price)
             elif symbol == "SPY":
                 market_state = item.get("marketState", "")
-                logger.info("SPY marketState=%s, preMarketPrice=%s, postMarketPrice=%s",
-                            market_state, item.get("preMarketPrice"), item.get("postMarketPrice"))
+                pre_p = item.get("preMarketPrice")
+                post_p = item.get("postMarketPrice")
+                _spy_debug = (f"SPY state={market_state} pre={pre_p} post={post_p} "
+                              f"reg={price}")
                 extended_price = None
                 if market_state in ("PRE", "PREPRE"):
-                    extended_price = item.get("preMarketPrice")
+                    extended_price = pre_p
                 elif market_state in ("POST", "POSTPOST"):
-                    extended_price = item.get("postMarketPrice")
+                    extended_price = post_p
                 if extended_price is not None:
                     # Scale SPY price to S&P 500 level (SPY ≈ 1/10 of S&P 500).
                     spx_premarket = float(extended_price) * 10
     except Exception as exc:
-        logger.warning("Yahoo request failed: %s", exc)
+        _spy_debug = f"ERR: {exc}"
 
     # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
@@ -616,7 +620,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     LAST_BTC_PRICE = btc_price
     LAST_SPX_PRICE = spx_price
 
-    return btc_price, spx_price, spx_premarket
+    return btc_price, spx_price, spx_premarket, _spy_debug
 
 
 def fetch_fx_yahoo() -> tuple[float, float, str]:
@@ -1660,13 +1664,14 @@ def build_st_block() -> str:
     prev_st = state.get("st")
     prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
-        btc_price, spx_price, spx_premarket = fetch_market_prices()
+        btc_price, spx_price, spx_premarket, spy_debug = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
         if spx_premarket is not None:
             pct = (spx_premarket - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
             spx_line += f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
+        spx_line += f"\n[debug] {spy_debug}"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
