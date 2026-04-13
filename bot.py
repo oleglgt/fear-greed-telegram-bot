@@ -38,7 +38,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.2.0"
+BOT_VERSION = "v2.3.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
