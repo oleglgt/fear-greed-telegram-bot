@@ -540,12 +540,14 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     except Exception:
         pass
 
-    # SPY extended-hours via CNBC quote API (Yahoo is rate-limited).
+    # CNBC quote API: regular S&P 500 (.SPX) and SPY extended-hours.
+    # Used both as a real-time fallback for Yahoo (which is rate-limited)
+    # and as the source of pre-market price (SPY × 10).
     try:
-        spy_resp = requests.get(
+        cnbc_resp = requests.get(
             "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol",
             params={
-                "symbols": "SPY",
+                "symbols": ".SPX|SPY",
                 "requestMethod": "itv",
                 "noBody": "1",
                 "partnerId": "2",
@@ -555,15 +557,19 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
             },
             headers=REQUEST_HEADERS_GENERIC, timeout=15,
         )
-        spy_resp.raise_for_status()
-        spy_data = spy_resp.json()
-        quote = spy_data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
-        if quote:
-            q = quote[0]
-            ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
-            if ext_last_str:
-                ext_price = float(ext_last_str.replace(",", ""))
-                spx_premarket = ext_price * 10
+        cnbc_resp.raise_for_status()
+        cnbc_data = cnbc_resp.json()
+        quotes = cnbc_data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym == ".SPX" and spx_price is None:
+                last_str = q.get("last", "")
+                if last_str:
+                    spx_price = float(last_str.replace(",", ""))
+            elif sym == "SPY":
+                ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
+                if ext_last_str:
+                    spx_premarket = float(ext_last_str.replace(",", "")) * 10
     except Exception:
         pass
 
