@@ -93,7 +93,7 @@ DIGEST_MAX_AGE_HOURS = 48
 DIGEST_REACTION_MAP: dict[str, str] = {}  # hash → source name (in-memory)
 DIGEST_REACTION_DELTAS = {"fire": 10, "like": 5, "dislike": -3, "poop": -5}
 DIGEST_CATEGORY_ICONS = {
-    "ai": "🤖", "investments": "💰", "robotics": "🦾", "vibecoding": "🛠️",
+    "ai": "🤖", "investments": "💰", "payments": "💳", "vibecoding": "🛠️",
     "tech": "⚡", "business": "💼", "other": "📰",
 }
 DIGEST_RSS_FEEDS: dict[str, list[str]] = {
@@ -104,10 +104,10 @@ DIGEST_RSS_FEEDS: dict[str, list[str]] = {
         "https://venturebeat.com/category/ai/feed/",
         "https://news.mit.edu/rss/topic/artificial-intelligence2",
     ],
-    "robotics": [
-        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
-        "https://techcrunch.com/category/robotics/feed/",
-        "https://www.therobotreport.com/feed/",
+    "payments": [
+        "https://hnrss.org/newest?q=AI+agent+payment+OR+stablecoin+agent+OR+agentic+commerce",
+        "https://www.pymnts.com/feed/",
+        "https://thefintechtimes.com/feed/",
     ],
     "vibecoding": [
         "https://hnrss.org/newest?q=AI+coding+OR+copilot+OR+cursor+OR+claude",
@@ -1470,14 +1470,14 @@ def score_digest_items_via_ai(items: list[dict[str, str]]) -> list[dict[str, str
                     "Scoring:\n"
                     "- Event importance (0-40): 35-40 breakthroughs/major, 25-34 significant, "
                     "15-24 trends, 5-14 minor\n"
-                    "- Topic priority (0-30): AI=30, Investments=27, Robotics=23, "
+                    "- Topic priority (0-30): AI=30, Investments=27, AI Payment Agents=23, "
                     "Vibe coding tools=18, Tech=12, Business=6, Other=1\n"
                     "- Source quality (0-20): Top tier=20, Good=15, Average=10, Unknown=5\n"
                     "- Freshness (0-10): <6h=10, 6-24h=7, 24-48h=3\n\n"
                     "Return strict JSON only:\n"
                     '{"items":[{"id":0,"score":85,"category":"ai",'
                     '"headline_ru":"заголовок","details_ru":"описание 2-3 предложения"}]}\n\n'
-                    "Categories: ai, investments, robotics, vibecoding, tech, business, other\n"
+                    "Categories: ai, investments, payments, vibecoding, tech, business, other\n"
                     "headline_ru and details_ru must be in Russian."
                 ),
             },
