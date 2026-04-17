@@ -45,7 +45,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.5.0"
+BOT_VERSION = "v2.6.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -559,56 +559,53 @@ def _try_source(label: str, fetch):
         return None
 
 
-def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None]:
+def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None]:
+    """Return (btc, spx_cash, spx_futures). ES=F trades ~23/5, so it doubles as the
+    pre-/after-market proxy for S&P 500 — much more accurate than SPY×10."""
     response = requests.get(
         YAHOO_QUOTE_URL,
-        params={"symbols": "BTC-USD,^GSPC"},
+        params={"symbols": "BTC-USD,^GSPC,ES=F"},
         headers=REQUEST_HEADERS_GENERIC,
         timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
-    btc = spx = None
+    btc = spx = futures = None
     for item in response.json()["quoteResponse"]["result"]:
         price = item.get("regularMarketPrice")
         if price is None:
             continue
-        if item.get("symbol") == "BTC-USD":
+        sym = item.get("symbol")
+        if sym == "BTC-USD":
             btc = float(price)
-        elif item.get("symbol") == "^GSPC":
+        elif sym == "^GSPC":
             spx = float(price)
-    return btc, spx
+        elif sym == "ES=F":
+            futures = float(price)
+    return btc, spx, futures
 
 
-def _fetch_cnbc_spx_and_premarket() -> tuple[float | None, float | None]:
-    """CNBC provides .SPX real-time and SPY extended-hours (×10 ≈ S&P pre-market)."""
+def _fetch_cnbc_spx() -> float:
+    """CNBC .SPX real-time — fallback for S&P cash when Yahoo is rate-limited."""
     response = requests.get(
         CNBC_QUOTE_URL,
         params={
-            "symbols": ".SPX|SPY",
+            "symbols": ".SPX",
             "requestMethod": "itv",
             "noBody": "1",
             "partnerId": "2",
             "fund": "1",
-            "exthrs": "1",
             "output": "json",
         },
         headers=REQUEST_HEADERS_GENERIC,
         timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
-    quotes = response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
-    spx = premarket = None
-    for q in quotes:
-        sym = q.get("symbol", "")
-        if sym == ".SPX":
+    for q in response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", []):
+        if q.get("symbol") == ".SPX":
             last_str = q.get("last", "")
             if last_str:
-                spx = float(last_str.replace(",", ""))
-        elif sym == "SPY":
-            ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
-            if ext_last_str:
-                premarket = float(ext_last_str.replace(",", "")) * 10
-    return spx, premarket
+                return float(last_str.replace(",", ""))
+    raise ValueError("CNBC: .SPX quote missing")
 
 
 def _fetch_coinbase_btc() -> float:
@@ -649,24 +646,24 @@ def _fetch_fred_spx() -> float:
 
 
 def fetch_market_prices() -> tuple[float, float, float | None]:
-    """Return (btc_price, spx_price, spx_premarket_price_or_None)."""
+    """Return (btc_price, spx_price, spx_futures_or_None).
+
+    spx_futures is the ES=F E-mini S&P 500 futures price when available; during
+    regular hours it tracks the cash index with small basis, off-hours it acts
+    as the pre-/after-market proxy.
+    """
     global LAST_BTC_PRICE, LAST_SPX_PRICE
 
     btc_price: float | None = None
     spx_price: float | None = None
-    spx_premarket: float | None = None
+    spx_futures: float | None = None
 
     yahoo = _try_source("yahoo", _fetch_yahoo_btc_spx)
     if yahoo:
-        btc_price, spx_price = yahoo
+        btc_price, spx_price, spx_futures = yahoo
 
-    # CNBC: real-time S&P fallback (Yahoo is rate-limited) and pre-market source.
-    cnbc = _try_source("cnbc", _fetch_cnbc_spx_and_premarket)
-    if cnbc:
-        cnbc_spx, spx_premarket = cnbc
-        if spx_price is None:
-            spx_price = cnbc_spx
-
+    if spx_price is None:
+        spx_price = _try_source("cnbc", _fetch_cnbc_spx)
     if btc_price is None:
         btc_price = _try_source("coinbase", _fetch_coinbase_btc)
     if btc_price is None:
@@ -688,7 +685,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     LAST_BTC_PRICE = btc_price
     LAST_SPX_PRICE = spx_price
 
-    return btc_price, spx_price, spx_premarket
+    return btc_price, spx_price, spx_futures
 
 
 def fetch_fx_yahoo() -> tuple[float, float, str]:
@@ -1720,14 +1717,14 @@ def build_st_block() -> str:
     prev_st = state.get("st")
     prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
-        btc_price, spx_price, spx_premarket = fetch_market_prices()
+        btc_price, spx_price, spx_futures = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
-        premarket_line = ""
-        if spx_premarket is not None:
-            pct = (spx_premarket - spx_price) / spx_price * 100
+        futures_line = ""
+        if spx_futures is not None:
+            pct = (spx_futures - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
-            premarket_line = f"\nS&P 500 Pre-Market (SPY×10): {spx_premarket:,.2f} ({sign}{pct:.2f}%)"
+            futures_line = f"\nS&P 500 Futures (ES=F): {spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
@@ -1753,7 +1750,7 @@ def build_st_block() -> str:
                 )
         except Exception as exc:
             logger.debug("st trend attach skipped: %s", exc)
-        return f"{btc_line}\n{spx_line}{premarket_line}"
+        return f"{btc_line}\n{spx_line}{futures_line}"
     except Exception as exc:
         return f"Рыночные цены: временно недоступны ({exc})"
 
