@@ -8,7 +8,7 @@ import re
 import textwrap
 import time as time_module
 import zipfile
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from functools import partial
 from html import escape as html_escape, unescape
@@ -34,6 +34,7 @@ YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
+STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -46,7 +47,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.7.0"
+BOT_VERSION = "v2.7.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -618,12 +619,84 @@ def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
     return btc_wk, spx_wk
 
 
+def _fetch_stooq_daily_oldest_close(symbol: str, days: int = 12) -> float:
+    """Fetch daily OHLC CSV from Stooq over the last `days`; return earliest close.
+
+    Stooq path is /q/d/l/?s=SYMBOL&d1=YYYYMMDD&d2=YYYYMMDD&i=d. Symbol examples:
+    btcusd, ^spx. CSV header: Date,Open,High,Low,Close,Volume — we want col 4 (Close).
+    """
+    today = datetime.now(timezone.utc).date()
+    params = {
+        "s": symbol,
+        "d1": (today - timedelta(days=days)).strftime("%Y%m%d"),
+        "d2": today.strftime("%Y%m%d"),
+        "i": "d",
+    }
+    response = requests.get(STOOQ_DAILY_URL, params=params, timeout=HTTP_TIMEOUT_SHORT)
+    response.raise_for_status()
+    lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"stooq daily: empty response for {symbol}")
+    start = 1 if lines[0].lower().startswith("date") else 0
+    for row in lines[start:]:
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) >= 5 and parts[4] not in {"", "N/D"}:
+            return float(parts[4])
+    raise ValueError(f"stooq daily: no numeric close for {symbol}")
+
+
+def _fetch_coingecko_btc_week_ago() -> float:
+    """CoinGecko market_chart — 7-day BTC history; return oldest price.
+
+    For days<=90 CoinGecko returns hourly data, the first entry is ~7 days old.
+    """
+    response = requests.get(
+        "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+        params={"vs_currency": "usd", "days": "7"},
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    prices = response.json().get("prices", [])
+    if not prices:
+        raise ValueError("coingecko history: empty prices")
+    return float(prices[0][1])
+
+
+def _fetch_week_ago_prices() -> tuple[float | None, float | None]:
+    """Return (btc_week_ago, spx_week_ago). Tries Yahoo spark (batched) first,
+    then per-symbol fallbacks (CoinGecko for BTC, Stooq daily for ^SPX)."""
+    btc_wk: float | None = None
+    spx_wk: float | None = None
+
+    yahoo = _try_source("yahoo_spark", _fetch_yahoo_week_ago_prices)
+    if yahoo:
+        btc_wk, spx_wk = yahoo
+
+    if btc_wk is None:
+        btc_wk = _try_source("coingecko_hist", _fetch_coingecko_btc_week_ago)
+    if spx_wk is None:
+        spx_wk = _try_source(
+            "stooq_daily_spx",
+            lambda: _fetch_stooq_daily_oldest_close("^spx"),
+        )
+    return btc_wk, spx_wk
+
+
 def _fetch_cnbc_spx() -> float:
     """CNBC .SPX real-time — fallback for S&P cash when Yahoo is rate-limited."""
+    return _fetch_cnbc_quote_last(".SPX")
+
+
+def _fetch_cnbc_futures() -> float:
+    """CNBC @ES.1 E-mini S&P 500 front-month futures — fallback when Yahoo 429s."""
+    return _fetch_cnbc_quote_last("@ES.1")
+
+
+def _fetch_cnbc_quote_last(symbol: str) -> float:
     response = requests.get(
         CNBC_QUOTE_URL,
         params={
-            "symbols": ".SPX",
+            "symbols": symbol,
             "requestMethod": "itv",
             "noBody": "1",
             "partnerId": "2",
@@ -635,11 +708,11 @@ def _fetch_cnbc_spx() -> float:
     )
     response.raise_for_status()
     for q in response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", []):
-        if q.get("symbol") == ".SPX":
+        if q.get("symbol") == symbol:
             last_str = q.get("last", "")
             if last_str:
                 return float(last_str.replace(",", ""))
-    raise ValueError("CNBC: .SPX quote missing")
+    raise ValueError(f"CNBC: {symbol} quote missing")
 
 
 def _fetch_coinbase_btc() -> float:
@@ -698,6 +771,8 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
 
     if spx_price is None:
         spx_price = _try_source("cnbc", _fetch_cnbc_spx)
+    if spx_futures is None:
+        spx_futures = _try_source("cnbc_es", _fetch_cnbc_futures)
     if btc_price is None:
         btc_price = _try_source("coinbase", _fetch_coinbase_btc)
     if btc_price is None:
@@ -1775,13 +1850,11 @@ def build_st_block() -> str:
             sign = "+" if pct >= 0 else ""
             futures_line = f"\nS&P 500 Futures (ES=F): {spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
 
-        week_ago = _try_source("yahoo_spark", _fetch_yahoo_week_ago_prices)
-        if week_ago:
-            btc_wk, spx_wk = week_ago
-            if btc_wk:
-                btc_line = f"{btc_line} {_format_week_pct(btc_price, btc_wk)}"
-            if spx_wk:
-                spx_line = f"{spx_line} {_format_week_pct(spx_price, spx_wk)}"
+        btc_wk, spx_wk = _fetch_week_ago_prices()
+        if btc_wk:
+            btc_line = f"{btc_line} {_format_week_pct(btc_price, btc_wk)}"
+        if spx_wk:
+            spx_line = f"{spx_line} {_format_week_pct(spx_price, spx_wk)}"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
