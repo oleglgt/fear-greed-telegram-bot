@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import os
 import io
 import json
@@ -20,6 +21,12 @@ from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("bot")
+
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
 YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
@@ -38,7 +45,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.3.1"
+BOT_VERSION = "v2.4.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -247,7 +254,15 @@ def render_block(
 
 async def render_block_async(**kwargs) -> tuple[str, bool]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(render_block, **kwargs))
+    try:
+        return await loop.run_in_executor(None, partial(render_block, **kwargs))
+    except Exception as exc:
+        block_name = kwargs.get("block_name", "?")
+        logger.exception("render_block(%s) crashed", block_name)
+        text = f"Блок {block_name}: временно недоступен ({exc})"
+        if kwargs.get("include_version"):
+            text = with_version(text)
+        return text, False
 
 
 async def send_rendered_update(update: Update, text: str, html_mode: bool) -> None:
@@ -514,6 +529,107 @@ def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
     return score, rating, updated_at
 
 
+CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+
+
+def _try_source(label: str, fetch):
+    """Call fetch() and log failures without raising. Returns None on error."""
+    try:
+        return fetch()
+    except Exception as exc:
+        logger.warning("market source %s failed: %s", label, exc)
+        return None
+
+
+def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None]:
+    response = requests.get(
+        YAHOO_QUOTE_URL,
+        params={"symbols": "BTC-USD,^GSPC"},
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    btc = spx = None
+    for item in response.json()["quoteResponse"]["result"]:
+        price = item.get("regularMarketPrice")
+        if price is None:
+            continue
+        if item.get("symbol") == "BTC-USD":
+            btc = float(price)
+        elif item.get("symbol") == "^GSPC":
+            spx = float(price)
+    return btc, spx
+
+
+def _fetch_cnbc_spx_and_premarket() -> tuple[float | None, float | None]:
+    """CNBC provides .SPX real-time and SPY extended-hours (×10 ≈ S&P pre-market)."""
+    response = requests.get(
+        CNBC_QUOTE_URL,
+        params={
+            "symbols": ".SPX|SPY",
+            "requestMethod": "itv",
+            "noBody": "1",
+            "partnerId": "2",
+            "fund": "1",
+            "exthrs": "1",
+            "output": "json",
+        },
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    quotes = response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+    spx = premarket = None
+    for q in quotes:
+        sym = q.get("symbol", "")
+        if sym == ".SPX":
+            last_str = q.get("last", "")
+            if last_str:
+                spx = float(last_str.replace(",", ""))
+        elif sym == "SPY":
+            ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
+            if ext_last_str:
+                premarket = float(ext_last_str.replace(",", "")) * 10
+    return spx, premarket
+
+
+def _fetch_coinbase_btc() -> float:
+    response = requests.get(
+        COINBASE_BTC_URL, params={"currency": "USD"}, timeout=HTTP_TIMEOUT_SHORT
+    )
+    response.raise_for_status()
+    return float(response.json()["data"]["amount"])
+
+
+def _fetch_coingecko_btc() -> float:
+    response = requests.get(
+        COINGECKO_BTC_URL,
+        params={"ids": "bitcoin", "vs_currencies": "usd"},
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    return float(response.json()["bitcoin"]["usd"])
+
+
+def _fetch_stooq_spx() -> float:
+    response = requests.get(STOOQ_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
+    response.raise_for_status()
+    price, _ = parse_stooq_csv_line(response.text)
+    return price
+
+
+def _fetch_fred_spx() -> float:
+    # FRED daily S&P500 series, CSV columns: DATE,SP500. Walk backwards for latest numeric.
+    response = requests.get(FRED_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
+    response.raise_for_status()
+    rows = [line.strip() for line in response.text.splitlines() if line.strip()]
+    for line in reversed(rows[1:]):
+        parts = line.split(",")
+        if len(parts) >= 2 and parts[1] not in {"", "."}:
+            return float(parts[1])
+    raise ValueError("FRED: no numeric row")
+
+
 def fetch_market_prices() -> tuple[float, float, float | None]:
     """Return (btc_price, spx_price, spx_premarket_price_or_None)."""
     global LAST_BTC_PRICE, LAST_SPX_PRICE
@@ -522,111 +638,27 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     spx_price: float | None = None
     spx_premarket: float | None = None
 
-    # Primary source: Yahoo Finance for BTC and S&P.
-    try:
-        params = {"symbols": "BTC-USD,^GSPC"}
-        response = requests.get(
-            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT
-        )
-        response.raise_for_status()
-        data = response.json()
+    yahoo = _try_source("yahoo", _fetch_yahoo_btc_spx)
+    if yahoo:
+        btc_price, spx_price = yahoo
 
-        results = data["quoteResponse"]["result"]
-        for item in results:
-            symbol = item.get("symbol")
-            price = item.get("regularMarketPrice")
-            if symbol == "BTC-USD" and price is not None:
-                btc_price = float(price)
-            elif symbol == "^GSPC" and price is not None:
-                spx_price = float(price)
-    except Exception:
-        pass
+    # CNBC: real-time S&P fallback (Yahoo is rate-limited) and pre-market source.
+    cnbc = _try_source("cnbc", _fetch_cnbc_spx_and_premarket)
+    if cnbc:
+        cnbc_spx, spx_premarket = cnbc
+        if spx_price is None:
+            spx_price = cnbc_spx
 
-    # CNBC quote API: regular S&P 500 (.SPX) and SPY extended-hours.
-    # Used both as a real-time fallback for Yahoo (which is rate-limited)
-    # and as the source of pre-market price (SPY × 10).
-    try:
-        cnbc_resp = requests.get(
-            "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol",
-            params={
-                "symbols": ".SPX|SPY",
-                "requestMethod": "itv",
-                "noBody": "1",
-                "partnerId": "2",
-                "fund": "1",
-                "exthrs": "1",
-                "output": "json",
-            },
-            headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT,
-        )
-        cnbc_resp.raise_for_status()
-        cnbc_data = cnbc_resp.json()
-        quotes = cnbc_data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
-        for q in quotes:
-            sym = q.get("symbol", "")
-            if sym == ".SPX" and spx_price is None:
-                last_str = q.get("last", "")
-                if last_str:
-                    spx_price = float(last_str.replace(",", ""))
-            elif sym == "SPY":
-                ext_last_str = q.get("ExtendedMktQuote", {}).get("last", "")
-                if ext_last_str:
-                    spx_premarket = float(ext_last_str.replace(",", "")) * 10
-    except Exception:
-        pass
-
-    # BTC fallback 1: Coinbase spot API.
     if btc_price is None:
-        try:
-            btc_response = requests.get(
-                COINBASE_BTC_URL, params={"currency": "USD"}, timeout=HTTP_TIMEOUT_SHORT
-            )
-            btc_response.raise_for_status()
-            btc_data = btc_response.json()
-            btc_price = float(btc_data["data"]["amount"])
-        except Exception:
-            pass
-
-    # BTC fallback 2: CoinGecko.
+        btc_price = _try_source("coinbase", _fetch_coinbase_btc)
     if btc_price is None:
-        try:
-            btc_response = requests.get(
-                COINGECKO_BTC_URL,
-                params={"ids": "bitcoin", "vs_currencies": "usd"},
-                timeout=HTTP_TIMEOUT_SHORT,
-            )
-            btc_response.raise_for_status()
-            btc_data = btc_response.json()
-            btc_price = float(btc_data["bitcoin"]["usd"])
-        except Exception:
-            pass
-
-    # S&P fallback 1: Stooq (^SPX intraday price from CSV).
+        btc_price = _try_source("coingecko", _fetch_coingecko_btc)
     if spx_price is None:
-        try:
-            spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
-            spx_response.raise_for_status()
-            spx_price, _ = parse_stooq_csv_line(spx_response.text)
-        except Exception:
-            pass
-
-    # S&P fallback 2: FRED daily S&P500 series (no API key).
+        spx_price = _try_source("stooq", _fetch_stooq_spx)
     if spx_price is None:
-        try:
-            fred_response = requests.get(FRED_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
-            fred_response.raise_for_status()
-            # CSV columns: DATE,SP500
-            rows = [line.strip() for line in fred_response.text.splitlines() if line.strip()]
-            # Walk backwards and take latest non-empty numeric value.
-            for line in reversed(rows[1:]):
-                parts = line.split(",")
-                if len(parts) >= 2 and parts[1] not in {"", "."}:
-                    spx_price = float(parts[1])
-                    break
-        except Exception:
-            pass
+        spx_price = _try_source("fred", _fetch_fred_spx)
 
-    # Last-resort fallback: last successful values in memory.
+    # Last-resort: last successful values in memory.
     if btc_price is None:
         btc_price = LAST_BTC_PRICE
     if spx_price is None:
@@ -749,20 +781,16 @@ def fetch_fx_open_er() -> tuple[float, float, str]:
 def fetch_fx_rates() -> tuple[float, float, str]:
     """
     Compact production mode for /fg:
-    Stooq first (best current reliability), then fallbacks.
+    Stooq first (best current reliability), then fallbacks. Last source raises on failure.
     """
-    try:
-        return fetch_fx_stooq()
-    except Exception:
-        pass
-    try:
-        return fetch_fx_yahoo()
-    except Exception:
-        pass
-    try:
-        return fetch_fx_frankfurter()
-    except Exception:
-        pass
+    for label, fetch in (
+        ("stooq", fetch_fx_stooq),
+        ("yahoo", fetch_fx_yahoo),
+        ("frankfurter", fetch_fx_frankfurter),
+    ):
+        result = _try_source(f"fx:{label}", fetch)
+        if result is not None:
+            return result
     return fetch_fx_open_er()
 
 
@@ -780,7 +808,8 @@ def load_news_history() -> dict[str, float]:
             return out
     except FileNotFoundError:
         return {}
-    except Exception:
+    except Exception as exc:
+        logger.warning("load_news_history failed: %s", exc)
         return {}
     return {}
 
@@ -798,7 +827,8 @@ def load_bot_state() -> dict[str, object]:
             return data
     except FileNotFoundError:
         return {}
-    except Exception:
+    except Exception as exc:
+        logger.warning("load_bot_state failed: %s", exc)
         return {}
     return {}
 
@@ -817,7 +847,8 @@ def format_state_saved_time(saved_at: object) -> str:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return format_cyprus_time(dt.astimezone(timezone.utc))
-    except Exception:
+    except Exception as exc:
+        logger.debug("format_state_saved_time fallback for %r: %s", raw, exc)
         return raw
 
 
@@ -1344,8 +1375,8 @@ async def restore_ratings_from_telegram(bot) -> bool:
         if isinstance(data, dict):
             save_source_ratings(data)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("restore_ratings_from_telegram failed: %s", exc)
     return False
 
 
@@ -1371,8 +1402,8 @@ async def backup_ratings_to_telegram(bot) -> None:
             message_id=msg.message_id,
             disable_notification=True,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("backup_ratings_to_telegram failed: %s", exc)
 
 
 # ── Digest V2: sent history ─────────────────────────────────────────────────
@@ -1477,7 +1508,8 @@ def score_digest_items_via_ai(items: list[dict[str, str]]) -> list[dict[str, str
                     items[idx]["headline_ru"] = headline_ru
                 if details_ru:
                     items[idx]["details_ru"] = details_ru
-        except Exception:
+        except Exception as exc:
+            logger.warning("digest scoring batch %d failed: %s", start // batch_size + 1, exc)
             continue
 
     return items
@@ -1543,7 +1575,8 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
                     if get_source_rating_score(source_ratings, src) < -5:
                         continue
                     all_items.append(item)
-            except Exception:
+            except Exception as exc:
+                logger.warning("digest feed %s failed: %s", feed_url, exc)
                 continue
 
     if not all_items:
@@ -1613,8 +1646,8 @@ def build_fear_greed_block() -> str:
             )
             if "ошибка" not in stock_block:
                 stock_block = f"{stock_block} {icon} {stock_prev}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("fg stock trend attach skipped: %s", exc)
 
     try:
         if "crypto_score" in prev_fg_dict:
@@ -1628,8 +1661,8 @@ def build_fear_greed_block() -> str:
             )
             if "ошибка" not in crypto_block:
                 crypto_block = f"{crypto_block} {icon} {crypto_prev}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("fg crypto trend attach skipped: %s", exc)
 
     if state_dirty:
         next_fg["saved_at"] = datetime.now(timezone.utc).isoformat()
@@ -1675,8 +1708,8 @@ def build_st_block() -> str:
                     f"{spx_line} "
                     f"{icon} [{prev_spx:,.2f} {prev_time}]"
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("st trend attach skipped: %s", exc)
         return f"{btc_line}\n{spx_line}{premarket_line}"
     except Exception as exc:
         return f"Рыночные цены: временно недоступны ({exc})"
@@ -1920,7 +1953,7 @@ async def on_startup(app) -> None:
     if restored:
         ratings = load_source_ratings()
         count = len(ratings)
-        print(f"[digest] Restored {count} source ratings from Telegram backup")
+        logger.info("digest: restored %d source ratings from Telegram backup", count)
     await app.bot.set_my_commands(
         [
             BotCommand("start", "помощь"),
@@ -1966,8 +1999,8 @@ async def on_startup(app) -> None:
                     f"Scheduler: {SCHEDULER_STATUS}"
                 ),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("deploy notification failed: %s", exc)
 
 
 def _check_access(update: Update) -> bool:
