@@ -15,3 +15,21 @@ versioning `vMAJOR.MINOR.PATCH`:
 
 Apply the bump in the same commit as the code change. When in doubt between
 two levels, pick the higher one.
+
+## Pull request workflow
+
+Single-user project — pre-merge review is not required. When a PR for this
+repository has been opened and CI (if any) passes, **merge it immediately
+with `squash` method**; do not ask the user to confirm each merge. The rest
+of the workflow stays the same:
+
+- Create a feature branch from `main`.
+- Bump `BOT_VERSION` and commit.
+- Push, open the PR.
+- Squash-merge it right away without waiting for a `merge` command.
+- If subscribed to PR activity, unsubscribe after merging (automatic on
+  merge events).
+
+Do not squash-merge if there are open questions that need the user's
+answer, or if the change is large/risky enough that the user asked to
+review it explicitly. Those are exceptions — default is merge-on-open.
