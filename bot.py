@@ -47,7 +47,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.7.1"
+BOT_VERSION = "v2.7.2"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -634,7 +634,8 @@ def _fetch_stooq_daily_oldest_close(symbol: str, days: int = 12) -> float:
     }
     response = requests.get(STOOQ_DAILY_URL, params=params, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
-    lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+    body = response.text
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
     if not lines:
         raise ValueError(f"stooq daily: empty response for {symbol}")
     start = 1 if lines[0].lower().startswith("date") else 0
@@ -642,7 +643,8 @@ def _fetch_stooq_daily_oldest_close(symbol: str, days: int = 12) -> float:
         parts = [p.strip() for p in row.split(",")]
         if len(parts) >= 5 and parts[4] not in {"", "N/D"}:
             return float(parts[4])
-    raise ValueError(f"stooq daily: no numeric close for {symbol}")
+    snippet = body[:140].replace("\n", " | ")
+    raise ValueError(f"stooq daily: no numeric close for {symbol}; body: {snippet!r}")
 
 
 def _fetch_coingecko_btc_week_ago() -> float:
@@ -662,9 +664,38 @@ def _fetch_coingecko_btc_week_ago() -> float:
     return float(prices[0][1])
 
 
+def _fetch_fred_spx_week_ago() -> float:
+    """FRED SP500 daily series — last close on or before (today - 7 days).
+
+    FRED returns ascending CSV (DATE,SP500); close-less days appear as '.' or ''.
+    """
+    response = requests.get(FRED_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
+    response.raise_for_status()
+    rows = [line.strip() for line in response.text.splitlines() if line.strip()]
+    if len(rows) < 2:
+        raise ValueError("FRED: empty response")
+    target = datetime.now(timezone.utc).date() - timedelta(days=7)
+    best: float | None = None
+    for line in rows[1:]:
+        parts = line.split(",")
+        if len(parts) < 2 or parts[1] in {"", "."}:
+            continue
+        try:
+            row_date = datetime.strptime(parts[0], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if row_date <= target:
+            best = float(parts[1])
+        else:
+            break  # rows are ascending; past target now
+    if best is None:
+        raise ValueError("FRED: no row on or before 7 days ago")
+    return best
+
+
 def _fetch_week_ago_prices() -> tuple[float | None, float | None]:
     """Return (btc_week_ago, spx_week_ago). Tries Yahoo spark (batched) first,
-    then per-symbol fallbacks (CoinGecko for BTC, Stooq daily for ^SPX)."""
+    then per-symbol fallbacks: CoinGecko for BTC; Stooq daily → FRED daily for ^SPX."""
     btc_wk: float | None = None
     spx_wk: float | None = None
 
@@ -679,6 +710,8 @@ def _fetch_week_ago_prices() -> tuple[float | None, float | None]:
             "stooq_daily_spx",
             lambda: _fetch_stooq_daily_oldest_close("^spx"),
         )
+    if spx_wk is None:
+        spx_wk = _try_source("fred_spx_wk", _fetch_fred_spx_week_ago)
     return btc_wk, spx_wk
 
 
@@ -688,8 +721,15 @@ def _fetch_cnbc_spx() -> float:
 
 
 def _fetch_cnbc_futures() -> float:
-    """CNBC @ES.1 E-mini S&P 500 front-month futures — fallback when Yahoo 429s."""
-    return _fetch_cnbc_quote_last("@ES.1")
+    """Try known CNBC symbol variants for E-mini S&P 500 front-month futures."""
+    last_err: Exception | None = None
+    for sym in ("@ES.1", "@ES", "ES.1", "ES", "ESc1", "/ES"):
+        try:
+            return _fetch_cnbc_quote_last(sym)
+        except (ValueError, requests.RequestException) as exc:
+            last_err = exc
+            continue
+    raise ValueError(f"CNBC: no ES futures symbol worked (last: {last_err})")
 
 
 def _fetch_cnbc_quote_last(symbol: str) -> float:
@@ -707,12 +747,14 @@ def _fetch_cnbc_quote_last(symbol: str) -> float:
         timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
-    for q in response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", []):
+    quotes = response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+    for q in quotes:
         if q.get("symbol") == symbol:
             last_str = q.get("last", "")
             if last_str:
                 return float(last_str.replace(",", ""))
-    raise ValueError(f"CNBC: {symbol} quote missing")
+    seen = [q.get("symbol") for q in quotes]
+    raise ValueError(f"CNBC: {symbol!r} not in response (got {seen[:5]})")
 
 
 def _fetch_coinbase_btc() -> float:
