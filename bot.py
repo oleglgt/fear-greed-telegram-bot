@@ -38,7 +38,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.3.0"
+BOT_VERSION = "v2.3.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -65,6 +65,8 @@ SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {}
 NEWS_TARGETS: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
 MAX_TELEGRAM_MESSAGE_LEN = 3900
+HTTP_TIMEOUT_SHORT = 15  # market/FX APIs
+HTTP_TIMEOUT_LONG = 30  # RSS feeds, XLSX downloads
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
     "politics": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -341,14 +343,14 @@ def get_token() -> str:
 
 def get_url_text(url: str, headers: dict[str, str] | None = None) -> str:
     req_headers = headers or REQUEST_HEADERS_GENERIC
-    response = requests.get(url, headers=req_headers, timeout=30)
+    response = requests.get(url, headers=req_headers, timeout=HTTP_TIMEOUT_LONG)
     response.raise_for_status()
     return response.text
 
 
 def get_url_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
     req_headers = headers or REQUEST_HEADERS_GENERIC
-    response = requests.get(url, headers=req_headers, timeout=30)
+    response = requests.get(url, headers=req_headers, timeout=HTTP_TIMEOUT_LONG)
     response.raise_for_status()
     return response.content
 
@@ -484,7 +486,7 @@ def fetch_cyprus_reservoirs_summary() -> str:
 
 
 def fetch_fear_and_greed() -> tuple[float, str, str]:
-    response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS_CNN, timeout=15)
+    response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS_CNN, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     data = response.json()
 
@@ -498,7 +500,7 @@ def fetch_fear_and_greed() -> tuple[float, str, str]:
 
 
 def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
-    response = requests.get(CRYPTO_API_URL, timeout=15)
+    response = requests.get(CRYPTO_API_URL, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     data = response.json()
 
@@ -524,7 +526,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     try:
         params = {"symbols": "BTC-USD,^GSPC"}
         response = requests.get(
-            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=15
+            YAHOO_QUOTE_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT
         )
         response.raise_for_status()
         data = response.json()
@@ -555,7 +557,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
                 "exthrs": "1",
                 "output": "json",
             },
-            headers=REQUEST_HEADERS_GENERIC, timeout=15,
+            headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT,
         )
         cnbc_resp.raise_for_status()
         cnbc_data = cnbc_resp.json()
@@ -577,7 +579,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     if btc_price is None:
         try:
             btc_response = requests.get(
-                COINBASE_BTC_URL, params={"currency": "USD"}, timeout=15
+                COINBASE_BTC_URL, params={"currency": "USD"}, timeout=HTTP_TIMEOUT_SHORT
             )
             btc_response.raise_for_status()
             btc_data = btc_response.json()
@@ -591,7 +593,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
             btc_response = requests.get(
                 COINGECKO_BTC_URL,
                 params={"ids": "bitcoin", "vs_currencies": "usd"},
-                timeout=15,
+                timeout=HTTP_TIMEOUT_SHORT,
             )
             btc_response.raise_for_status()
             btc_data = btc_response.json()
@@ -602,7 +604,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     # S&P fallback 1: Stooq (^SPX intraday price from CSV).
     if spx_price is None:
         try:
-            spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=15)
+            spx_response = requests.get(STOOQ_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
             spx_response.raise_for_status()
             spx_price, _ = parse_stooq_csv_line(spx_response.text)
         except Exception:
@@ -611,7 +613,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     # S&P fallback 2: FRED daily S&P500 series (no API key).
     if spx_price is None:
         try:
-            fred_response = requests.get(FRED_SPX_CSV_URL, timeout=15)
+            fred_response = requests.get(FRED_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
             fred_response.raise_for_status()
             # CSV columns: DATE,SP500
             rows = [line.strip() for line in fred_response.text.splitlines() if line.strip()]
@@ -644,7 +646,7 @@ def fetch_fx_yahoo() -> tuple[float, float, str]:
         YAHOO_QUOTE_URL,
         params={"symbols": "EURUSD=X,EURRUB=X,RUB=X,USDRUB=X"},
         headers=REQUEST_HEADERS_GENERIC,
-        timeout=15,
+        timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
     data = response.json()
@@ -700,7 +702,7 @@ def fetch_fx_frankfurter() -> tuple[float, float, str]:
     response = requests.get(
         FRANKFURTER_LATEST_URL,
         params={"from": "EUR", "to": "USD,RUB"},
-        timeout=15,
+        timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
     data = response.json()
@@ -723,7 +725,7 @@ def fetch_fx_frankfurter() -> tuple[float, float, str]:
 
 
 def fetch_fx_open_er() -> tuple[float, float, str]:
-    response = requests.get(OPEN_ER_API_URL, timeout=15)
+    response = requests.get(OPEN_ER_API_URL, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     data = response.json()
     rates = data["rates"]
@@ -841,45 +843,6 @@ def news_item_fingerprint(item: dict[str, str]) -> str:
     return f"{source}|{title}"
 
 
-def normalize_category(value: str) -> str:
-    raw = normalize_text(value).lower()
-    if raw in {"politics", "political", "geopolitics", "world", "government"}:
-        return "politics"
-    if raw in {"technology", "tech", "ai", "science", "startup", "startups"}:
-        return "technology"
-    if raw in {"markets", "market", "finance", "business", "economy", "economics"}:
-        return "markets"
-    return raw or "news"
-
-
-def parse_ai_news_items(text: str) -> list[dict[str, str]]:
-    payload = text.strip()
-    if payload.startswith("```"):
-        payload = re.sub(r"^```[a-zA-Z0-9]*\n?", "", payload)
-        payload = re.sub(r"\n?```$", "", payload).strip()
-    parsed = json.loads(payload)
-    items = parsed.get("items", [])
-    if not isinstance(items, list):
-        raise ValueError("AI JSON format invalid")
-
-    out: list[dict[str, str]] = []
-    for raw in items:
-        if not isinstance(raw, dict):
-            continue
-        item = {
-            "category": normalize_category(str(raw.get("category", ""))),
-            "headline_en": normalize_text(str(raw.get("headline_en", ""))),
-            "headline_ru": normalize_text(str(raw.get("headline_ru", ""))),
-            "source": normalize_text(str(raw.get("source", ""))),
-            "published_at": normalize_text(str(raw.get("published_at", ""))),
-            "details_en": normalize_text(str(raw.get("details_en", ""))),
-            "url": normalize_text(str(raw.get("url", ""))),
-        }
-        if item["headline_en"] and item["details_en"] and item["url"]:
-            out.append(item)
-    return out
-
-
 def parse_feed_datetime(raw: str) -> datetime | None:
     text = normalize_text(raw)
     if not text:
@@ -906,13 +869,51 @@ def parse_feed_datetime(raw: str) -> datetime | None:
     return None
 
 
+ATOM_NS = "{http://www.w3.org/2005/Atom}"
+DC_DATE_TAG = "{http://purl.org/dc/elements/1.1/}date"
+
+
+def _build_feed_item(
+    category: str,
+    title: str,
+    link: str,
+    source: str,
+    details: str,
+    published_dt: datetime | None,
+) -> dict[str, str] | None:
+    if not title or not link or not published_dt:
+        return None
+    return {
+        "category": category,
+        "headline_en": title,
+        "headline_ru": title,
+        "source": source,
+        "published_at": format_cyprus_time(published_dt),
+        "details_en": details or "Details are not available in feed.",
+        "details_ru": "",
+        "url": link,
+        "_published_dt": published_dt.isoformat(),
+    }
+
+
+def _atom_pick_link(node) -> str:
+    link = ""
+    for link_node in node.findall(f"{ATOM_NS}link"):
+        href = normalize_text(link_node.attrib.get("href", ""))
+        rel = normalize_text(link_node.attrib.get("rel", "alternate")).lower()
+        if href and rel in {"", "alternate"}:
+            return href
+        if href and not link:
+            link = href
+    return link
+
+
 def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
     root = ET.fromstring(xml_text)
     out: list[dict[str, str]] = []
 
     # RSS format: channel/item
-    rss_items = root.findall(".//channel/item")
-    for node in rss_items:
+    for node in root.findall(".//channel/item"):
         title = normalize_text(unescape(node.findtext("title", default="")))
         link = normalize_text(node.findtext("link", default=""))
         source = normalize_text(node.findtext("source", default="")) or "RSS"
@@ -920,68 +921,31 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
         published_raw = (
             node.findtext("pubDate", default="")
             or node.findtext("date", default="")
-            or node.findtext("{http://purl.org/dc/elements/1.1/}date", default="")
+            or node.findtext(DC_DATE_TAG, default="")
         )
-        published_dt = parse_feed_datetime(published_raw)
-        if not title or not link or not published_dt:
-            continue
-        out.append(
-            {
-                "category": category,
-                "headline_en": title,
-                "headline_ru": title,
-                "source": source,
-                "published_at": format_cyprus_time(published_dt),
-                "details_en": details or "Details are not available in feed.",
-                "details_ru": "",
-                "url": link,
-                "_published_dt": published_dt.isoformat(),
-            }
+        item = _build_feed_item(
+            category, title, link, source, details, parse_feed_datetime(published_raw)
         )
+        if item:
+            out.append(item)
 
     # Atom format: entry with XML namespace.
-    atom_entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
-    for node in atom_entries:
-        title = normalize_text(
-            unescape(node.findtext("{http://www.w3.org/2005/Atom}title", default=""))
-        )
-        source = "RSS"
-        details = normalize_text(
-            unescape(node.findtext("{http://www.w3.org/2005/Atom}summary", default=""))
-        )
+    for node in root.findall(f".//{ATOM_NS}entry"):
+        title = normalize_text(unescape(node.findtext(f"{ATOM_NS}title", default="")))
+        details = normalize_text(unescape(node.findtext(f"{ATOM_NS}summary", default="")))
         if not details:
-            details = normalize_text(
-                unescape(node.findtext("{http://www.w3.org/2005/Atom}content", default=""))
-            )
-        link = ""
-        for link_node in node.findall("{http://www.w3.org/2005/Atom}link"):
-            href = normalize_text(link_node.attrib.get("href", ""))
-            rel = normalize_text(link_node.attrib.get("rel", "alternate")).lower()
-            if href and rel in {"", "alternate"}:
-                link = href
-                break
-            if href and not link:
-                link = href
+            details = normalize_text(unescape(node.findtext(f"{ATOM_NS}content", default="")))
+        link = _atom_pick_link(node)
         published_raw = (
-            node.findtext("{http://www.w3.org/2005/Atom}updated", default="")
-            or node.findtext("{http://www.w3.org/2005/Atom}published", default="")
+            node.findtext(f"{ATOM_NS}updated", default="")
+            or node.findtext(f"{ATOM_NS}published", default="")
         )
-        published_dt = parse_feed_datetime(published_raw)
-        if not title or not link or not published_dt:
-            continue
-        out.append(
-            {
-                "category": category,
-                "headline_en": title,
-                "headline_ru": title,
-                "source": source,
-                "published_at": format_cyprus_time(published_dt),
-                "details_en": details or "Details are not available in feed.",
-                "details_ru": "",
-                "url": link,
-                "_published_dt": published_dt.isoformat(),
-            }
+        item = _build_feed_item(
+            category, title, link, "RSS", details, parse_feed_datetime(published_raw)
         )
+        if item:
+            out.append(item)
+
     return out
 
 
