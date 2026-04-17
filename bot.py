@@ -47,7 +47,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.7.2"
+BOT_VERSION = "v2.7.3"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -721,9 +721,14 @@ def _fetch_cnbc_spx() -> float:
 
 
 def _fetch_cnbc_futures() -> float:
-    """Try known CNBC symbol variants for E-mini S&P 500 front-month futures."""
+    """Try known CNBC symbol variants for E-mini S&P 500 front-month futures.
+
+    Restricted to futures-specific symbol formats. Bare 'ES' is excluded because
+    it collides with NYSE:ES (Eversource Energy stock, ~$70) — in v2.7.2 that
+    collision surfaced as a '-99% vs cash' nonsense reading on /st.
+    """
     last_err: Exception | None = None
-    for sym in ("@ES.1", "@ES", "ES.1", "ES", "ESc1", "/ES"):
+    for sym in ("@ES.1", "@ES", "ES.1"):
         try:
             return _fetch_cnbc_quote_last(sym)
         except (ValueError, requests.RequestException) as exc:
@@ -835,6 +840,16 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
 
     LAST_BTC_PRICE = btc_price
     LAST_SPX_PRICE = spx_price
+
+    # Sanity: ES front-month should track cash S&P within a few %. Anything
+    # further off is almost certainly a wrong symbol (ticker collision or
+    # API returning a different instrument).
+    if spx_futures is not None and not (0.9 * spx_price <= spx_futures <= 1.1 * spx_price):
+        logger.warning(
+            "spx_futures=%.2f discarded (far from spx=%.2f, likely wrong symbol)",
+            spx_futures, spx_price,
+        )
+        spx_futures = None
 
     return btc_price, spx_price, spx_futures
 
