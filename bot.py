@@ -30,6 +30,7 @@ logger = logging.getLogger("bot")
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=8"
 YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
+YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
@@ -45,7 +46,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.6.0"
+BOT_VERSION = "v2.7.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -582,6 +583,39 @@ def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None]:
         elif sym == "ES=F":
             futures = float(price)
     return btc, spx, futures
+
+
+def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
+    """Return (btc_week_ago, spx_week_ago) — closes from ~7 days ago.
+
+    Uses Yahoo spark endpoint which batches multiple symbols. range=10d with
+    interval=1d gives ~10 points for BTC (24/7) and ~6-7 points for ^GSPC
+    (weekdays only); the oldest valid close approximates "7 days ago".
+    """
+    response = requests.get(
+        YAHOO_SPARK_URL,
+        params={"symbols": "BTC-USD,^GSPC", "range": "10d", "interval": "1d"},
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    btc_wk = spx_wk = None
+    for entry in response.json().get("spark", {}).get("result", []):
+        symbol = entry.get("symbol")
+        responses = entry.get("response", [])
+        if not responses:
+            continue
+        indicators = responses[0].get("indicators", {}).get("quote", [{}])
+        closes = (indicators[0] if indicators else {}).get("close", [])
+        valid_closes = [c for c in closes if c is not None]
+        if len(valid_closes) < 2:
+            continue
+        week_ago = float(valid_closes[0])
+        if symbol == "BTC-USD":
+            btc_wk = week_ago
+        elif symbol == "^GSPC":
+            spx_wk = week_ago
+    return btc_wk, spx_wk
 
 
 def _fetch_cnbc_spx() -> float:
@@ -1641,6 +1675,21 @@ def _format_week_delta(current: float, prev_week: float) -> str:
     return f"{arrow}({sign}{delta:.0f} vs 1wk)"
 
 
+def _format_week_pct(current: float, week_ago: float) -> str:
+    """Format '(+2.53% vs 1wk)' with sign and arrow emoji for price movers."""
+    if not week_ago:
+        return ""
+    pct = (current - week_ago) / week_ago * 100
+    if abs(pct) < 0.05:
+        arrow = "⚫"
+    elif pct > 0:
+        arrow = "🟢"
+    else:
+        arrow = "🔴"
+    sign = "+" if pct >= 0 else ""
+    return f"{arrow}({sign}{pct:.2f}% vs 1wk)"
+
+
 def build_fear_greed_block() -> str:
     state = load_bot_state()
     prev_fg = state.get("fg")
@@ -1725,6 +1774,14 @@ def build_st_block() -> str:
             pct = (spx_futures - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
             futures_line = f"\nS&P 500 Futures (ES=F): {spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
+
+        week_ago = _try_source("yahoo_spark", _fetch_yahoo_week_ago_prices)
+        if week_ago:
+            btc_wk, spx_wk = week_ago
+            if btc_wk:
+                btc_line = f"{btc_line} {_format_week_pct(btc_price, btc_wk)}"
+            if spx_wk:
+                spx_line = f"{spx_line} {_format_week_pct(spx_price, spx_wk)}"
         next_st: dict[str, object] = dict(prev_st_dict)
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
