@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=1"
+CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=8"
 YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
@@ -45,7 +45,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.4.0"
+BOT_VERSION = "v2.5.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -500,33 +500,51 @@ def fetch_cyprus_reservoirs_summary() -> str:
     )
 
 
-def fetch_fear_and_greed() -> tuple[float, str, str]:
+def fetch_fear_and_greed() -> tuple[float, str, str, float | None]:
+    """Return (score, rating, updated_at, prev_1_week_score_or_None)."""
     response = requests.get(CNN_API_URL, headers=REQUEST_HEADERS_CNN, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     data = response.json()
 
-    score = data["fear_and_greed"]["score"]
-    rating = data["fear_and_greed"]["rating"]
-    timestamp_raw = data["fear_and_greed"]["timestamp"]
-    dt_utc = parse_timestamp_utc(timestamp_raw)
+    fg = data["fear_and_greed"]
+    score = float(fg["score"])
+    rating = str(fg["rating"])
+    dt_utc = parse_timestamp_utc(fg["timestamp"])
     updated_at = format_cyprus_time(dt_utc)
 
-    return float(score), str(rating), updated_at
+    prev_week_raw = fg.get("previous_1_week")
+    prev_week: float | None = None
+    if prev_week_raw is not None:
+        try:
+            prev_week = float(prev_week_raw)
+        except (TypeError, ValueError):
+            prev_week = None
+
+    return score, rating, updated_at, prev_week
 
 
-def fetch_crypto_fear_and_greed() -> tuple[int, str, str]:
+def fetch_crypto_fear_and_greed() -> tuple[int, str, str, int | None]:
+    """Return (score, rating, updated_at, score_7d_ago_or_None). API returns newest first."""
     response = requests.get(CRYPTO_API_URL, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
-    data = response.json()
+    rows = response.json().get("data", [])
+    if not rows:
+        raise ValueError("crypto FG: empty data")
 
-    latest = data["data"][0]
+    latest = rows[0]
     score = int(latest["value"])
     rating = str(latest["value_classification"])
-    timestamp_raw = latest["timestamp"]
-    dt_utc = parse_timestamp_utc(timestamp_raw)
+    dt_utc = parse_timestamp_utc(latest["timestamp"])
     updated_at = format_cyprus_time(dt_utc)
 
-    return score, rating, updated_at
+    prev_week: int | None = None
+    if len(rows) >= 8:
+        try:
+            prev_week = int(rows[7]["value"])
+        except (KeyError, TypeError, ValueError):
+            prev_week = None
+
+    return score, rating, updated_at, prev_week
 
 
 CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
@@ -1166,12 +1184,15 @@ def call_openai_chat(
 def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, str]], list[str]]:
     now_utc_dt = datetime.now(timezone.utc)
     now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    cutoff = now_utc_dt.timestamp() - 24 * 3600
+    now_ts = now_utc_dt.timestamp()
+    cutoff = now_ts - 24 * 3600
+    history = prune_news_history(load_news_history(), now_ts)
     by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in NEWS_TARGETS}
     seen: set[str] = set()
     debug_logs: list[str] = []
     if debug_mode:
         debug_logs.append(f"UTC now: {now_utc}")
+        debug_logs.append(f"History: {len(history)} items in last {NEWS_HISTORY_HOURS}h")
         debug_logs.append("Cache: miss (forced live fetch)")
     for category, count in NEWS_TARGETS:
         if debug_mode:
@@ -1193,7 +1214,7 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
                     if published_dt.timestamp() < cutoff:
                         continue
                     fp = news_item_fingerprint(item)
-                    if fp in seen:
+                    if fp in seen or fp in history:
                         continue
                     seen.add(fp)
                     item["_ts"] = str(published_dt.timestamp())
@@ -1232,6 +1253,11 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
 
     if not final_items:
         raise NewsFetchError("No fresh RSS items from last 24h", debug_logs)
+
+    for item in final_items:
+        history[news_item_fingerprint(item)] = now_ts
+    save_news_history(history)
+
     return final_items, debug_logs
 
 
@@ -1605,6 +1631,19 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
     return selected, ""
 
 
+def _format_week_delta(current: float, prev_week: float) -> str:
+    """Format '(-5 vs 1wk)' with sign and arrow emoji."""
+    delta = current - prev_week
+    if abs(delta) < 0.5:
+        arrow = "⚫"
+    elif delta > 0:
+        arrow = "🟢"
+    else:
+        arrow = "🔴"
+    sign = "+" if delta >= 0 else ""
+    return f"{arrow}({sign}{delta:.0f} vs 1wk)"
+
+
 def build_fear_greed_block() -> str:
     state = load_bot_state()
     prev_fg = state.get("fg")
@@ -1616,8 +1655,10 @@ def build_fear_greed_block() -> str:
     c_score: int | None = None
 
     try:
-        score, rating, updated_at = fetch_fear_and_greed()
+        score, rating, updated_at, stock_prev_week = fetch_fear_and_greed()
         stock_block = f"Stock Fear & Greed (CNN): {score:.2f} {rating} {updated_at}"
+        if stock_prev_week is not None:
+            stock_block += f" {_format_week_delta(score, stock_prev_week)}"
         next_fg["stock_score"] = score
         next_fg["stock_rating"] = rating
         next_fg["stock_updated_at"] = updated_at
@@ -1626,8 +1667,10 @@ def build_fear_greed_block() -> str:
         stock_block = f"Stock Fear & Greed (CNN): ошибка ({exc})"
 
     try:
-        c_score, c_rating, c_updated_at = fetch_crypto_fear_and_greed()
+        c_score, c_rating, c_updated_at, crypto_prev_week = fetch_crypto_fear_and_greed()
         crypto_block = f"Crypto Fear & Greed: {c_score} {c_rating} {c_updated_at}"
+        if crypto_prev_week is not None:
+            crypto_block += f" {_format_week_delta(float(c_score), float(crypto_prev_week))}"
         next_fg["crypto_score"] = c_score
         next_fg["crypto_rating"] = c_rating
         next_fg["crypto_updated_at"] = c_updated_at
