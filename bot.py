@@ -1,11 +1,11 @@
 import asyncio
-import hashlib
 import logging
 import os
 import io
 import json
 import re
 import textwrap
+import threading
 import time as time_module
 import zipfile
 from datetime import datetime, time, timedelta, timezone
@@ -13,12 +13,13 @@ from email.utils import parsedate_to_datetime
 from functools import partial
 from html import escape as html_escape, unescape
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import requests
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import RetryAfter
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 
 logging.basicConfig(
@@ -47,7 +48,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.7.3"
+BOT_VERSION = "v2.8.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -79,7 +80,7 @@ HTTP_TIMEOUT_LONG = 30  # RSS feeds, XLSX downloads
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
     "politics": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://rss.cnn.com/rss/edition_world.rss",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
         "https://www.theguardian.com/world/rss",
     ],
     "technology": [
@@ -89,7 +90,7 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
     ],
     "markets": [
         "https://www.marketwatch.com/rss/topstories",
-        "https://feeds.reuters.com/reuters/businessNews",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     ],
 }
@@ -101,7 +102,7 @@ DIGEST_SENT_HOURS = 72
 DIGEST_TARGET_COUNT = 12
 DIGEST_NEW_SOURCE_RATIO = 0.33
 DIGEST_MAX_AGE_HOURS = 48
-DIGEST_REACTION_MAP: dict[str, str] = {}  # hash → source name (in-memory)
+DIGEST_SCORE_MAX_ITEMS = 100  # cap AI scoring cost: only the freshest N go to OpenAI
 DIGEST_REACTION_DELTAS = {"fire": 10, "like": 5, "dislike": -3, "poop": -5}
 DIGEST_CATEGORY_ICONS = {
     "ai": "🤖", "investments": "💰", "payments": "💳", "vibecoding": "🛠️",
@@ -131,7 +132,7 @@ DIGEST_RSS_FEEDS: dict[str, list[str]] = {
         "https://feeds.arstechnica.com/arstechnica/index",
     ],
     "business": [
-        "https://feeds.reuters.com/reuters/businessNews",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     ],
     "investments": [
@@ -140,10 +141,30 @@ DIGEST_RSS_FEEDS: dict[str, list[str]] = {
 }
 
 
+# Serializes read-modify-write cycles on the JSON state files: scheduled jobs
+# and user commands render in separate executor threads and may overlap.
+STATE_LOCK = threading.RLock()
+
+
 class NewsFetchError(Exception):
     def __init__(self, message: str, debug_logs: list[str] | None = None):
         super().__init__(message)
         self.debug_logs = debug_logs or []
+
+
+def atomic_write_json(path: str, data: object, indent: int | None = None) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=indent)
+    os.replace(tmp_path, path)
+
+
+def source_name_from_url(url: str) -> str:
+    try:
+        host = urlparse(url).netloc
+    except ValueError:
+        return ""
+    return host.lower().split(":")[0].removeprefix("www.")
 
 
 def with_version(text: str) -> str:
@@ -591,7 +612,8 @@ def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
 
     Uses Yahoo spark endpoint which batches multiple symbols. range=10d with
     interval=1d gives ~10 points for BTC (24/7) and ~6-7 points for ^GSPC
-    (weekdays only); the oldest valid close approximates "7 days ago".
+    (weekdays only); we pick the close whose timestamp is nearest to 7 days
+    ago (falling back to the oldest close if timestamps are missing).
     """
     response = requests.get(
         YAHOO_SPARK_URL,
@@ -600,6 +622,7 @@ def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
         timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
+    target_ts = datetime.now(timezone.utc).timestamp() - 7 * 86400
     btc_wk = spx_wk = None
     for entry in response.json().get("spark", {}).get("result", []):
         symbol = entry.get("symbol")
@@ -608,10 +631,19 @@ def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
             continue
         indicators = responses[0].get("indicators", {}).get("quote", [{}])
         closes = (indicators[0] if indicators else {}).get("close", [])
-        valid_closes = [c for c in closes if c is not None]
-        if len(valid_closes) < 2:
-            continue
-        week_ago = float(valid_closes[0])
+        timestamps = responses[0].get("timestamp", [])
+        pairs = [
+            (float(ts), float(close))
+            for ts, close in zip(timestamps, closes)
+            if ts is not None and close is not None
+        ]
+        if len(pairs) >= 2:
+            week_ago = min(pairs, key=lambda p: abs(p[0] - target_ts))[1]
+        else:
+            valid_closes = [c for c in closes if c is not None]
+            if len(valid_closes) < 2:
+                continue
+            week_ago = float(valid_closes[0])
         if symbol == "BTC-USD":
             btc_wk = week_ago
         elif symbol == "^GSPC":
@@ -996,8 +1028,7 @@ def load_news_history() -> dict[str, float]:
 
 
 def save_news_history(history: dict[str, float]) -> None:
-    with open(NEWS_HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False)
+    atomic_write_json(NEWS_HISTORY_FILE, history)
 
 
 def load_bot_state() -> dict[str, object]:
@@ -1015,8 +1046,7 @@ def load_bot_state() -> dict[str, object]:
 
 
 def save_bot_state(state: dict[str, object]) -> None:
-    with open(BOT_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False)
+    atomic_write_json(BOT_STATE_FILE, state)
 
 
 def format_state_saved_time(saved_at: object) -> str:
@@ -1120,15 +1150,27 @@ def _atom_pick_link(node) -> str:
     return link
 
 
-def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
+def parse_news_feed_items(
+    xml_text: str, category: str, feed_url: str = ""
+) -> list[dict[str, str]]:
     root = ET.fromstring(xml_text)
     out: list[dict[str, str]] = []
+    # Feeds almost never carry the optional <source> tag, so derive the source
+    # name from the article domain (works for aggregators like hnrss too),
+    # falling back to the feed's own domain. A literal "RSS" bucket would
+    # collapse all sources into one rating entry.
+    feed_source = source_name_from_url(feed_url)
 
     # RSS format: channel/item
     for node in root.findall(".//channel/item"):
         title = normalize_text(unescape(node.findtext("title", default="")))
         link = normalize_text(node.findtext("link", default=""))
-        source = normalize_text(node.findtext("source", default="")) or "RSS"
+        source = (
+            normalize_text(node.findtext("source", default=""))
+            or source_name_from_url(link)
+            or feed_source
+            or "RSS"
+        )
         details = normalize_text(unescape(node.findtext("description", default="")))
         published_raw = (
             node.findtext("pubDate", default="")
@@ -1148,12 +1190,13 @@ def parse_news_feed_items(xml_text: str, category: str) -> list[dict[str, str]]:
         if not details:
             details = normalize_text(unescape(node.findtext(f"{ATOM_NS}content", default="")))
         link = _atom_pick_link(node)
+        source = source_name_from_url(link) or feed_source or "RSS"
         published_raw = (
             node.findtext(f"{ATOM_NS}updated", default="")
             or node.findtext(f"{ATOM_NS}published", default="")
         )
         item = _build_feed_item(
-            category, title, link, "RSS", details, parse_feed_datetime(published_raw)
+            category, title, link, source, details, parse_feed_datetime(published_raw)
         )
         if item:
             out.append(item)
@@ -1367,7 +1410,7 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
                 break
             try:
                 xml_text = get_url_text(feed_url)
-                feed_items = parse_news_feed_items(xml_text, category)
+                feed_items = parse_news_feed_items(xml_text, category, feed_url)
                 fresh_items: list[dict[str, str]] = []
                 for item in feed_items:
                     published_raw = item.pop("_published_dt", "")
@@ -1417,9 +1460,11 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     if not final_items:
         raise NewsFetchError("No fresh RSS items from last 24h", debug_logs)
 
-    for item in final_items:
-        history[news_item_fingerprint(item)] = now_ts
-    save_news_history(history)
+    with STATE_LOCK:
+        history = prune_news_history(load_news_history(), now_ts)
+        for item in final_items:
+            history[news_item_fingerprint(item)] = now_ts
+        save_news_history(history)
 
     return final_items, debug_logs
 
@@ -1514,8 +1559,7 @@ def load_source_ratings() -> dict[str, dict]:
 
 
 def save_source_ratings(ratings: dict[str, dict]) -> None:
-    with open(DIGEST_SOURCE_RATINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(ratings, f, ensure_ascii=False, indent=2)
+    atomic_write_json(DIGEST_SOURCE_RATINGS_FILE, ratings, indent=2)
 
 
 def get_source_rating_score(ratings: dict, source: str) -> float:
@@ -1529,18 +1573,25 @@ def is_proven_source(ratings: dict, source: str) -> bool:
 
 
 def update_source_rating(source: str, delta: float) -> None:
-    ratings = load_source_ratings()
-    key = source.lower().strip()
-    entry = ratings.get(key, {"score": 0, "count": 0})
-    entry["score"] = float(entry.get("score", 0)) + delta
-    entry["count"] = int(entry.get("count", 0)) + 1
-    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-    ratings[key] = entry
-    save_source_ratings(ratings)
+    with STATE_LOCK:
+        ratings = load_source_ratings()
+        key = source.lower().strip()
+        entry = ratings.get(key, {"score": 0, "count": 0})
+        entry["score"] = float(entry.get("score", 0)) + delta
+        entry["count"] = int(entry.get("count", 0)) + 1
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+        ratings[key] = entry
+        save_source_ratings(ratings)
 
 
-def source_hash(source: str) -> str:
-    return hashlib.md5(source.lower().strip().encode()).hexdigest()[:12]
+def reaction_callback_data(reaction: str, source: str) -> str:
+    """Build callback_data carrying the source name itself (Telegram limit: 64 bytes).
+
+    Source names are feed/article domains, so they fit; an in-memory hash map
+    would forget sources on restart and pollute ratings with hash keys.
+    """
+    safe_source = source.encode("utf-8")[:40].decode("utf-8", "ignore").strip() or "rss"
+    return f"dr2:{reaction}:{safe_source}"
 
 
 DIGEST_BACKUP_CAPTION = "#digest_ratings_backup"
@@ -1591,6 +1642,17 @@ async def backup_ratings_to_telegram(bot) -> None:
             message_id=msg.message_id,
             disable_notification=True,
         )
+        # Drop the previous backup message so pins/documents don't pile up.
+        with STATE_LOCK:
+            state = load_bot_state()
+            prev_msg_id = state.get("ratings_backup_msg_id")
+            state["ratings_backup_msg_id"] = msg.message_id
+            save_bot_state(state)
+        if isinstance(prev_msg_id, int) and prev_msg_id != msg.message_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=prev_msg_id)
+            except Exception as exc:
+                logger.debug("old ratings backup delete failed: %s", exc)
     except Exception as exc:
         logger.warning("backup_ratings_to_telegram failed: %s", exc)
 
@@ -1608,8 +1670,17 @@ def load_sent_digests() -> list[dict]:
 
 
 def save_sent_digests(digests: list[dict]) -> None:
-    with open(DIGEST_SENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(digests, f, ensure_ascii=False)
+    atomic_write_json(DIGEST_SENT_FILE, digests)
+
+
+def record_sent_digests(items: list[dict[str, str]]) -> None:
+    """Mark items as sent — call only after they were actually delivered."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    with STATE_LOCK:
+        digests = prune_sent_digests(load_sent_digests(), now_ts)
+        for item in items:
+            digests.append({"fingerprint": news_item_fingerprint(item), "sent_at": now_ts})
+        save_sent_digests(digests)
 
 
 def prune_sent_digests(digests: list[dict], now_ts: float) -> list[dict]:
@@ -1749,7 +1820,7 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
         for feed_url in feeds:
             try:
                 xml_text = get_url_text(feed_url)
-                feed_items = parse_news_feed_items(xml_text, category)
+                feed_items = parse_news_feed_items(xml_text, category, feed_url)
                 for item in feed_items:
                     pub_raw = item.pop("_published_dt", "")
                     pub_dt = parse_feed_datetime(pub_raw)
@@ -1763,6 +1834,7 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
                     src = item.get("source", "")
                     if get_source_rating_score(source_ratings, src) < -5:
                         continue
+                    item["_ts"] = str(pub_dt.timestamp())
                     all_items.append(item)
             except Exception as exc:
                 logger.warning("digest feed %s failed: %s", feed_url, exc)
@@ -1770,6 +1842,16 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
 
     if not all_items:
         return [], "Нет свежих новостей за последние 48ч."
+
+    all_items.sort(key=lambda x: float(x.get("_ts", "0")), reverse=True)
+    if len(all_items) > DIGEST_SCORE_MAX_ITEMS:
+        logger.info(
+            "digest: capped %d items to %d freshest before AI scoring",
+            len(all_items), DIGEST_SCORE_MAX_ITEMS,
+        )
+        all_items = all_items[:DIGEST_SCORE_MAX_ITEMS]
+    for item in all_items:
+        item.pop("_ts", None)
 
     all_items = score_digest_items_via_ai(all_items)
 
@@ -1780,17 +1862,9 @@ def build_digest_v2() -> tuple[list[dict[str, str]], str]:
 
     selected = select_digest_items(all_items, source_ratings)
 
-    # Record sent fingerprints.
-    for item in selected:
-        fp = news_item_fingerprint(item)
-        sent_digests.append({"fingerprint": fp, "sent_at": now_utc.timestamp()})
-    save_sent_digests(sent_digests)
-
-    # Populate reaction map (hash → source) for callback handler.
-    for item in selected:
-        src = item.get("source", "")
-        DIGEST_REACTION_MAP[source_hash(src)] = src
-
+    # Sent fingerprints are recorded by the caller (record_sent_digests) only
+    # for items that were actually delivered — otherwise a failed send would
+    # lose those news forever.
     return selected, ""
 
 
@@ -1887,8 +1961,10 @@ def build_fear_greed_block() -> str:
 
     if state_dirty:
         next_fg["saved_at"] = datetime.now(timezone.utc).isoformat()
-        state["fg"] = next_fg
-        save_bot_state(state)
+        with STATE_LOCK:
+            state = load_bot_state()
+            state["fg"] = next_fg
+            save_bot_state(state)
 
     return f"{stock_block}\n{crypto_block}"
 
@@ -1916,8 +1992,10 @@ def build_st_block() -> str:
         next_st["btc_price"] = btc_price
         next_st["spx_price"] = spx_price
         next_st["saved_at"] = datetime.now(timezone.utc).isoformat()
-        state["st"] = next_st
-        save_bot_state(state)
+        with STATE_LOCK:
+            state = load_bot_state()
+            state["st"] = next_st
+            save_bot_state(state)
 
         try:
             prev_time = format_state_saved_time(prev_st_dict.get("saved_at", ""))
@@ -1971,7 +2049,10 @@ def get_target_chat_id() -> int | None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_access(update):
         return
-    await update.message.reply_text(
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
         with_version(
             "Привет! Я показываю Fear & Greed Index.\n"
             "Команды:\n"
@@ -2086,10 +2167,33 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_rendered_chat(context, chat_id, text, html_mode)
 
 
+async def _reply_digest_item(message, text: str, keyboard: InlineKeyboardMarkup) -> bool:
+    """Send one digest message, waiting out Telegram flood limits. Returns success."""
+    for _ in range(3):
+        try:
+            await message.reply_text(
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+            return True
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+        except Exception as exc:
+            logger.warning("digest item send failed: %s", exc)
+            return False
+    logger.warning("digest item send failed: flood limit persisted after retries")
+    return False
+
+
 async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_access(update):
         return
-    msg = await update.effective_message.reply_text("⏳ Собираю дайджест...")
+    message = update.effective_message
+    if message is None:
+        return
+    msg = await message.reply_text("⏳ Собираю дайджест...")
 
     loop = asyncio.get_running_loop()
     selected, error = await loop.run_in_executor(None, build_digest_v2)
@@ -2100,6 +2204,7 @@ async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await msg.delete()
 
+    sent_items: list[dict[str, str]] = []
     for item in selected:
         cat = item.get("ai_category", item.get("category", "other"))
         icon = DIGEST_CATEGORY_ICONS.get(cat, "📰")
@@ -2116,32 +2221,34 @@ async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if url:
             text += f'<a href="{html_escape(url, quote=True)}">Читать →</a>'
 
-        src_h = source_hash(source)
-        DIGEST_REACTION_MAP[src_h] = source
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("🔥", callback_data=f"dr:fire:{src_h}"),
-                    InlineKeyboardButton("👍", callback_data=f"dr:like:{src_h}"),
-                    InlineKeyboardButton("👎", callback_data=f"dr:dislike:{src_h}"),
-                    InlineKeyboardButton("💩", callback_data=f"dr:poop:{src_h}"),
+                    InlineKeyboardButton("🔥", callback_data=reaction_callback_data("fire", source)),
+                    InlineKeyboardButton("👍", callback_data=reaction_callback_data("like", source)),
+                    InlineKeyboardButton("👎", callback_data=reaction_callback_data("dislike", source)),
+                    InlineKeyboardButton("💩", callback_data=reaction_callback_data("poop", source)),
                 ]
             ]
         )
 
-        await update.effective_message.reply_text(
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=keyboard,
-        )
+        if await _reply_digest_item(message, text, keyboard):
+            sent_items.append(item)
 
-    await update.effective_message.reply_text(
-        with_version(
-            f"Дайджест: {len(selected)} новостей | "
-            f"{format_cyprus_time(datetime.now(timezone.utc))}"
-        )
+    if sent_items:
+        await loop.run_in_executor(None, record_sent_digests, sent_items)
+
+    summary = f"Дайджест: {len(sent_items)} новостей"
+    failed_count = len(selected) - len(sent_items)
+    if failed_count:
+        summary += f" ({failed_count} не отправлено)"
+    await message.reply_text(
+        with_version(f"{summary} | {format_cyprus_time(datetime.now(timezone.utc))}")
     )
+
+
+async def _ratings_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await backup_ratings_to_telegram(context.bot)
 
 
 async def digest_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2152,25 +2259,38 @@ async def digest_reaction_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⛔")
         return
 
-    parts = query.data.split(":")
-    if len(parts) != 3 or parts[0] != "dr":
+    parts = query.data.split(":", 2)
+    if len(parts) != 3 or parts[0] not in {"dr", "dr2"}:
         return
 
-    reaction = parts[1]
-    src_h = parts[2]
+    tag, reaction, ref = parts
     delta = DIGEST_REACTION_DELTAS.get(reaction)
     if delta is None:
         await query.answer("?")
         return
 
-    source_name = DIGEST_REACTION_MAP.get(src_h, src_h)
-    update_source_rating(source_name, delta)
+    if tag == "dr":
+        # Legacy buttons referenced an in-memory hash map that didn't survive
+        # restarts; rating by hash would pollute source_ratings.json.
+        await query.answer("⚠️ Кнопка устарела (бот перезапускался)")
+        return
+
+    source_name = ref
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, update_source_rating, source_name, delta)
 
     icons = {"fire": "🔥", "like": "👍", "dislike": "👎", "poop": "💩"}
     await query.answer(f"{icons.get(reaction, '✓')} {source_name}")
 
-    # Backup ratings to Telegram so they survive redeploys.
-    await backup_ratings_to_telegram(context.bot)
+    # Backup ratings to Telegram so they survive redeploys. Debounce via
+    # job_queue so a burst of reactions produces one upload, not N pins.
+    job_queue = context.application.job_queue
+    if job_queue is not None:
+        for job in job_queue.get_jobs_by_name("ratings_backup"):
+            job.schedule_removal()
+        job_queue.run_once(_ratings_backup_job, when=60, name="ratings_backup")
+    else:
+        await backup_ratings_to_telegram(context.bot)
 
 
 async def on_startup(app) -> None:
@@ -2244,6 +2364,11 @@ def main() -> None:
     raw_uid = os.getenv("ALLOWED_USER_ID", "").strip()
     if raw_uid:
         ALLOWED_USER_ID = int(raw_uid)
+    else:
+        logger.warning(
+            "ALLOWED_USER_ID is not set — bot commands (including OpenAI-backed "
+            "/digest and /news) are open to ANY Telegram user"
+        )
 
     app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
@@ -2255,7 +2380,7 @@ def main() -> None:
     app.add_handler(CommandHandler("digest", digest_cmd))
     app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CallbackQueryHandler(digest_reaction_callback, pattern=r"^dr:"))
+    app.add_handler(CallbackQueryHandler(digest_reaction_callback, pattern=r"^dr2?:"))
 
     app.run_polling()
 
