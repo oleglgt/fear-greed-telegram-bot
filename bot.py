@@ -32,6 +32,7 @@ CNN_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=8"
 YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
@@ -66,7 +67,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.10.0"
+BOT_VERSION = "v2.11.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -814,6 +815,25 @@ def _fetch_cnbc_futures() -> float:
     raise ValueError(f"CNBC: no ES futures symbol worked (last: {last_err})")
 
 
+def _fetch_yahoo_chart_price(symbol: str) -> float:
+    """Yahoo v8 chart meta price — crumb-free endpoint that keeps working when
+    the v7 quote API answers 401 (Invalid Crumb) or 429. For ES=F the meta
+    price is live nearly 24/5, which is what makes the futures line usable as
+    the pre-/after-market proxy."""
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": "1d", "interval": "5m"},
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    result = response.json()["chart"]["result"][0]
+    price = result.get("meta", {}).get("regularMarketPrice")
+    if price is None:
+        raise ValueError(f"yahoo chart: no meta price for {symbol}")
+    return float(price)
+
+
 def _fetch_cnbc_quote_last(symbol: str) -> float:
     response = requests.get(
         CNBC_QUOTE_URL,
@@ -893,10 +913,18 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     if yahoo:
         btc_price, spx_price, spx_futures = yahoo
 
-    if spx_price is None:
-        spx_price = _try_source("cnbc", _fetch_cnbc_spx)
+    if spx_futures is None:
+        spx_futures = _try_source(
+            "yahoo_chart_es", lambda: _fetch_yahoo_chart_price("ES=F")
+        )
     if spx_futures is None:
         spx_futures = _try_source("cnbc_es", _fetch_cnbc_futures)
+    if spx_price is None:
+        spx_price = _try_source("cnbc", _fetch_cnbc_spx)
+    if spx_price is None:
+        spx_price = _try_source(
+            "yahoo_chart_spx", lambda: _fetch_yahoo_chart_price("^GSPC")
+        )
     if btc_price is None:
         btc_price = _try_source("coinbase", _fetch_coinbase_btc)
     if btc_price is None:
@@ -929,6 +957,57 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         spx_futures = None
 
     return btc_price, spx_price, spx_futures
+
+
+def build_st_debug_block() -> str:
+    """Probe every market data source with raw values/errors — shows why the
+    futures (pre-/after-market) line is missing when it is."""
+    lines = ["Market sources probe:"]
+
+    try:
+        response = requests.get(
+            YAHOO_QUOTE_URL,
+            params={"symbols": "BTC-USD,^GSPC,ES=F"},
+            headers=REQUEST_HEADERS_GENERIC,
+            timeout=HTTP_TIMEOUT_SHORT,
+        )
+        lines.append(f"• yahoo v7 quote: HTTP {response.status_code}")
+        if response.ok:
+            results = response.json().get("quoteResponse", {}).get("result", [])
+            if not results:
+                lines.append("  (empty result list)")
+            for item in results:
+                parts = [f"  {item.get('symbol')}: state={item.get('marketState', '?')}"]
+                for field in ("regularMarketPrice", "preMarketPrice", "postMarketPrice"):
+                    value = item.get(field)
+                    if value is not None:
+                        parts.append(f"{field}={value}")
+                lines.append(" ".join(parts))
+        else:
+            lines.append(f"  body: {normalize_text(response.text)[:160]}")
+    except Exception as exc:
+        lines.append(f"• yahoo v7 quote FAILED {type(exc).__name__}: {exc}")
+
+    for label, fetch in (
+        ("yahoo v8 chart ^GSPC", lambda: _fetch_yahoo_chart_price("^GSPC")),
+        ("yahoo v8 chart ES=F", lambda: _fetch_yahoo_chart_price("ES=F")),
+        ("cnbc .SPX", _fetch_cnbc_spx),
+        ("cnbc @ES.1", lambda: _fetch_cnbc_quote_last("@ES.1")),
+        ("cnbc @ES", lambda: _fetch_cnbc_quote_last("@ES")),
+        ("cnbc ES.1", lambda: _fetch_cnbc_quote_last("ES.1")),
+        ("coinbase BTC", _fetch_coinbase_btc),
+        ("coingecko BTC", _fetch_coingecko_btc),
+        ("stooq ^SPX", _fetch_stooq_spx),
+        ("fred SP500", _fetch_fred_spx),
+    ):
+        try:
+            lines.append(f"• {label}: {fetch():,.2f}")
+        except Exception as exc:
+            lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:140]}")
+
+    lines.append("")
+    lines.append("Пришлите этот вывод — по нему чинится строка futures/pre-market в /st.")
+    return "\n".join(lines)
 
 
 def fetch_fx_yahoo() -> tuple[float, float, str]:
@@ -2022,11 +2101,14 @@ def build_st_block() -> str:
         btc_price, spx_price, spx_futures = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
-        futures_line = ""
         if spx_futures is not None:
             pct = (spx_futures - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
             futures_line = f"\nS&P 500 Futures (ES=F): {spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
+        else:
+            # Surface the failure instead of silently dropping the line: the
+            # futures price is the pre-/after-market signal for S&P 500.
+            futures_line = "\nS&P 500 Futures (ES=F): n/a (источники недоступны, детали: /st debug)"
 
         btc_wk, spx_wk = _fetch_week_ago_prices()
         if btc_wk:
@@ -2169,6 +2251,15 @@ async def fx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_access(update):
+        return
+    if context.args and context.args[0].strip().lower() in {"debug", "dbg", "probe"}:
+        loop = asyncio.get_running_loop()
+        try:
+            text = await loop.run_in_executor(None, build_st_debug_block)
+        except Exception as exc:
+            logger.exception("st debug probe crashed")
+            text = f"Market sources probe: ошибка ({exc})"
+        await reply_long_text(update, with_version(text))
         return
     text, html_mode = await render_block_async(block_name="st", include_version=True)
     await send_rendered_update(update, text, html_mode)
