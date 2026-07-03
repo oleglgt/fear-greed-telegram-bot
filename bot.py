@@ -44,11 +44,24 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
+# Candidate sources for /dam debug probe: the old Lotus Notes WDD site is being
+# phased out in favour of the new MOA portal and the Cyprus Dams Monitor, so
+# probe all of them from production (which has open egress) to pick a new source.
+DAM_DEBUG_PROBE_URLS: list[str] = [
+    WDD_RESERVOIRS_PAGE_URL,
+    "https://www.moi.gov.cy/moa/wdd/wdd.nsf/page18_en/page18_en?opendocument",
+    "https://moa.gov.cy/sectors/water-resources/water-development-department/?lang=en",
+    "https://www.gov.cy/moa-wdd/en/",
+    "https://dams.wdd.moa.gov.cy/",
+    "https://dams.wdd.moa.gov.cy/api/dams",
+    "https://cyprus-water.appspot.com/api",
+    "https://fragmata.info/",
+]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.8.0"
+BOT_VERSION = "v2.9.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -2039,6 +2052,40 @@ def build_dam_block() -> str:
         return f"Cyprus reservoirs: временно недоступно ({exc})"
 
 
+def build_dam_debug_block() -> str:
+    """Probe candidate WDD data sources and report raw HTTP diagnostics.
+
+    /dam relies on scraping; when the site moves, this probe (run from the
+    deployment, which has open egress) shows which URL still serves usable data.
+    """
+    lines = [f"Cyprus reservoirs probe ({len(DAM_DEBUG_PROBE_URLS)} URLs):"]
+    for url in DAM_DEBUG_PROBE_URLS:
+        try:
+            response = requests.get(
+                url, headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT
+            )
+            ctype = response.headers.get("Content-Type", "?").split(";")[0].strip()
+            body = ""
+            if any(t in ctype for t in ("text", "json", "xml")):
+                body = response.text
+            xlsx_refs = len(re.findall(r"\.xlsx", body, flags=re.I))
+            note = f"xlsx_refs={xlsx_refs}"
+            if "json" in ctype and body:
+                note = f"body: {normalize_text(body)[:180]}"
+            final_url = ""
+            if response.url.rstrip("/") != url.rstrip("/"):
+                final_url = f"\n  -> {response.url}"
+            lines.append(
+                f"• {url}{final_url}\n"
+                f"  {response.status_code} {ctype} {len(response.content)}B {note}"
+            )
+        except Exception as exc:
+            lines.append(f"• {url}\n  FAILED {type(exc).__name__}: {exc}")
+    lines.append("")
+    lines.append("Пришлите этот вывод — по нему выбирается рабочий источник для /dam.")
+    return "\n".join(lines)
+
+
 def get_target_chat_id() -> int | None:
     raw = os.getenv("TELEGRAM_TARGET_CHAT_ID", "").strip()
     if not raw:
@@ -2092,6 +2139,15 @@ async def st(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def dam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_access(update):
+        return
+    if context.args and context.args[0].strip().lower() in {"debug", "dbg", "probe"}:
+        loop = asyncio.get_running_loop()
+        try:
+            text = await loop.run_in_executor(None, build_dam_debug_block)
+        except Exception as exc:
+            logger.exception("dam debug probe crashed")
+            text = f"Cyprus reservoirs probe: ошибка ({exc})"
+        await reply_long_text(update, with_version(text))
         return
     text, html_mode = await render_block_async(block_name="dam", include_version=True)
     await send_rendered_update(update, text, html_mode)
