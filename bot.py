@@ -36,13 +36,15 @@ YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
-STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&i=1"
+# Stooq /q/l/ answers 404 without the full field spec (f=...&e=csv).
+STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&f=sd2t2ohlcv&h&e=csv"
+STOOQ_ES_FUTURES_CSV_URL = "https://stooq.com/q/l/?s=es.f&f=sd2t2ohlcv&h&e=csv"
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
-STOOQ_EURUSD_CSV_URL = "https://stooq.com/q/l/?s=eurusd&i=1"
-STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
+STOOQ_EURUSD_CSV_URL = "https://stooq.com/q/l/?s=eurusd&f=sd2t2ohlcv&h&e=csv"
+STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&f=sd2t2ohlcv&h&e=csv"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
@@ -68,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v3.0.0"
+BOT_VERSION = "v3.1.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -894,13 +896,27 @@ def _fetch_cnbc_quote_last(symbol: str) -> float:
     )
     response.raise_for_status()
     quotes = response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+    entry = None
     for q in quotes:
         if q.get("symbol") == symbol:
-            last_str = q.get("last", "")
-            if last_str:
-                return float(last_str.replace(",", ""))
-    seen = [q.get("symbol") for q in quotes]
-    raise ValueError(f"CNBC: {symbol!r} not in response (got {seen[:5]})")
+            entry = q
+            break
+    if entry is None:
+        seen = [q.get("symbol") for q in quotes]
+        raise ValueError(f"CNBC: {symbol!r} not in response (got {seen[:5]})")
+    # Off-session the price moves out of "last" into the extended-market quote
+    # (that's why the futures line vanished exactly when it was needed).
+    extended = entry.get("ExtendedMktQuote") or {}
+    for raw in (entry.get("last"), extended.get("last"), entry.get("previous_day_closing")):
+        if raw in (None, ""):
+            continue
+        try:
+            return float(str(raw).replace(",", ""))
+        except ValueError:
+            continue
+    raise ValueError(
+        f"CNBC: {symbol!r} present but no price fields (keys: {sorted(entry)[:10]})"
+    )
 
 
 def _fetch_coinbase_btc() -> float:
@@ -923,6 +939,17 @@ def _fetch_coingecko_btc() -> float:
 
 def _fetch_stooq_spx() -> float:
     response = requests.get(STOOQ_SPX_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
+    response.raise_for_status()
+    price, _ = parse_stooq_csv_line(response.text)
+    return price
+
+
+def _fetch_stooq_es_futures() -> float:
+    """Stooq continuous E-mini S&P 500 futures (es.f) — last-resort futures
+    source for when Yahoo is rate-limited and CNBC misbehaves. The ±10%%
+    vs-cash sanity check in fetch_market_prices guards against this symbol
+    ever resolving to a different instrument."""
+    response = requests.get(STOOQ_ES_FUTURES_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     price, _ = parse_stooq_csv_line(response.text)
     return price
@@ -963,6 +990,8 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
         )
     if spx_futures is None:
         spx_futures = _try_source("cnbc_es", _fetch_cnbc_futures)
+    if spx_futures is None:
+        spx_futures = _try_source("stooq_es", _fetch_stooq_es_futures)
     if spx_price is None:
         spx_price = _try_source("cnbc", _fetch_cnbc_spx)
     if spx_price is None:
@@ -1039,6 +1068,7 @@ def build_st_debug_block() -> str:
         ("cnbc @ES.1", lambda: _fetch_cnbc_quote_last("@ES.1")),
         ("cnbc @ES", lambda: _fetch_cnbc_quote_last("@ES")),
         ("cnbc ES.1", lambda: _fetch_cnbc_quote_last("ES.1")),
+        ("stooq es.f", _fetch_stooq_es_futures),
         ("coinbase BTC", _fetch_coinbase_btc),
         ("coingecko BTC", _fetch_coingecko_btc),
         ("stooq ^SPX", _fetch_stooq_spx),
