@@ -8,6 +8,7 @@ import textwrap
 import threading
 import time as time_module
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from functools import partial
@@ -67,7 +68,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.11.0"
+BOT_VERSION = "v3.0.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -113,6 +114,46 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     ],
 }
+
+# ── /hot: most-discussed stories ─────────────────────────────────────────────
+# "Discussed" = covered by many distinct outlets: similar headlines from
+# different feeds are clustered, clusters ranked by distinct source count.
+# Wider feed pool than /news so the coverage signal has something to measure.
+HOT_RSS_FEEDS: dict[str, list[str]] = {
+    "politics": [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.theguardian.com/world/rss",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://feeds.skynews.com/feeds/rss/world.xml",
+        "https://www.france24.com/en/rss",
+    ],
+    "technology": [
+        "https://techcrunch.com/feed/",
+        "https://www.theverge.com/rss/index.xml",
+        "https://feeds.arstechnica.com/arstechnica/index",
+        "https://www.engadget.com/rss.xml",
+        "https://feeds.bbci.co.uk/news/technology/rss.xml",
+        "https://www.wired.com/feed/rss",
+    ],
+    "markets": [
+        "https://www.marketwatch.com/rss/topstories",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.theguardian.com/uk/business/rss",
+        "https://fortune.com/feed/",
+    ],
+}
+HOT_WINDOW_HOURS = 24
+HOT_TARGET_COUNT = 10
+HOT_CATEGORY_ICONS = {"politics": "🌍", "technology": "⚡", "markets": "💹"}
+HOT_TITLE_STOPWORDS = frozenset(
+    "the and for with that this from are was were has have had been will would "
+    "could should say says said after amid over under about into more than "
+    "new live update updates report reports news its his her their our your "
+    "who what when where why how not out off all can may might just also "
+    "against between during before because while still being".split()
+)
 
 # ── Digest V2 ────────────────────────────────────────────────────────────────
 DIGEST_SOURCE_RATINGS_FILE = "source_ratings.json"
@@ -286,6 +327,9 @@ def render_block(
             debug_mode=debug_mode,
             use_spoilers=html_mode,
         )
+    elif block_name == "hot":
+        html_mode = news_spoilers and not debug_mode
+        text = build_hot_news_block(force_refresh=force_refresh, use_spoilers=html_mode)
     else:
         raise ValueError(f"Unknown block: {block_name}")
 
@@ -1670,6 +1714,176 @@ def build_news_block(
         return content
 
 
+# ── /hot: most-discussed stories ─────────────────────────────────────────────
+
+
+def ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    d = n % 10
+    if d == 1:
+        return one
+    if 2 <= d <= 4:
+        return few
+    return many
+
+
+def _title_tokens(title: str) -> set[str]:
+    words = re.findall(r"[a-z0-9']+", title.lower())
+    return {w for w in words if len(w) >= 3 and w not in HOT_TITLE_STOPWORDS}
+
+
+def _same_story(tokens_a: set[str], tokens_b: set[str]) -> bool:
+    if not tokens_a or not tokens_b:
+        return False
+    inter = len(tokens_a & tokens_b)
+    overlap = inter / min(len(tokens_a), len(tokens_b))
+    # Different outlets word the same event differently; 3+ shared significant
+    # words (or 2+ covering most of the shorter headline) is a solid match.
+    return inter >= 3 or (inter >= 2 and overlap >= 0.6)
+
+
+def _fetch_hot_feed(category: str, feed_url: str) -> list[dict[str, str]]:
+    try:
+        xml_text = get_url_text(feed_url)
+        return parse_news_feed_items(xml_text, category, feed_url)
+    except Exception as exc:
+        logger.warning("hot feed %s failed: %s", feed_url, exc)
+        return []
+
+
+def collect_hot_items() -> list[dict[str, str]]:
+    cutoff = datetime.now(timezone.utc).timestamp() - HOT_WINDOW_HOURS * 3600
+    tasks = [(cat, url) for cat, urls in HOT_RSS_FEEDS.items() for url in urls]
+    items: list[dict[str, str]] = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for feed_items in pool.map(lambda t: _fetch_hot_feed(*t), tasks):
+            items.extend(feed_items)
+
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for item in items:
+        pub_raw = item.pop("_published_dt", "")
+        pub_dt = parse_feed_datetime(pub_raw)
+        if not pub_dt or pub_dt.timestamp() < cutoff:
+            continue
+        fp = news_item_fingerprint(item)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        item["_ts"] = str(pub_dt.timestamp())
+        out.append(item)
+    return out
+
+
+def cluster_hot_items(items: list[dict[str, str]]) -> list[dict]:
+    """Group items into story clusters by headline token similarity."""
+    clusters: list[dict] = []
+    for item in items:
+        tokens = _title_tokens(item.get("headline_en", ""))
+        target = None
+        for cluster in clusters:
+            if any(_same_story(tokens, member) for member in cluster["token_sets"]):
+                target = cluster
+                break
+        if target is None:
+            target = {"items": [], "token_sets": []}
+            clusters.append(target)
+        target["items"].append(item)
+        target["token_sets"].append(tokens)
+
+    for cluster in clusters:
+        cluster["sources"] = {i.get("source", "") for i in cluster["items"]}
+        cluster["newest_ts"] = max(float(i.get("_ts", "0")) for i in cluster["items"])
+    return clusters
+
+
+def build_hot_news_block(force_refresh: bool = False, use_spoilers: bool = False) -> str:
+    ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
+    fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cache_key = "hot_html" if use_spoilers else "hot_plain"
+    cached_entry = NEWS_CACHE.get(cache_key)
+    if (
+        not force_refresh
+        and isinstance(cached_entry, dict)
+        and cached_entry.get("content")
+        and float(cached_entry.get("expires_at", 0.0)) > now_ts
+    ):
+        return str(cached_entry["content"])
+
+    try:
+        items = collect_hot_items()
+        if not items:
+            raise NewsFetchError(f"нет свежих новостей за последние {HOT_WINDOW_HOURS}ч")
+
+        clusters = cluster_hot_items(items)
+        clusters.sort(
+            key=lambda c: (len(c["sources"]), len(c["items"]), c["newest_ts"]),
+            reverse=True,
+        )
+        top = clusters[:HOT_TARGET_COUNT]
+
+        # One representative (freshest item) per cluster; translated as a batch.
+        reps = [
+            max(c["items"], key=lambda x: float(x.get("_ts", "0"))) for c in top
+        ]
+        translate_news_best_effort(reps)
+
+        lines = [f"🔥 Самые обсуждаемые ({HOT_WINDOW_HOURS}ч):", ""]
+        for idx, (cluster, rep) in enumerate(zip(top, reps), 1):
+            n_src = len(cluster["sources"])
+            icon = HOT_CATEGORY_ICONS.get(rep.get("category", ""), "📰")
+            headline = rep.get("headline_ru") or rep.get("headline_en", "")
+            src_label = f"{n_src} {ru_plural(n_src, 'источник', 'источника', 'источников')}"
+            details = format_expanded_details(rep)
+
+            # Newest link per distinct source, capped to keep messages compact.
+            newest_per_source: dict[str, dict[str, str]] = {}
+            for member in sorted(
+                cluster["items"], key=lambda x: float(x.get("_ts", "0")), reverse=True
+            ):
+                newest_per_source.setdefault(member.get("source", ""), member)
+            link_items = list(newest_per_source.items())[:4]
+
+            if use_spoilers:
+                lines.append(f"{idx}. {icon} <b>{html_escape(headline)}</b> — {src_label}")
+                lines.append(f"<blockquote expandable>{html_escape(details)}</blockquote>")
+                lines.append(
+                    " · ".join(
+                        f'<a href="{html_escape(member["url"], quote=True)}">{html_escape(source)}</a>'
+                        for source, member in link_items
+                    )
+                )
+            else:
+                lines.append(f"{idx}. {icon} {headline} — {src_label}")
+                lines.append(details)
+                for source, member in link_items:
+                    lines.append(f"{source}: {member['url']}")
+            lines.append("")
+
+        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
+        content = "\n".join(lines)
+        NEWS_CACHE[cache_key] = {
+            "content": content,
+            "expires_at": now_ts + max(ttl, 60),
+            "updated_at": now_ts,
+        }
+        return content
+    except Exception as exc:
+        content = (
+            f"Обсуждаемые новости: временно недоступно ({exc})\n\n"
+            f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
+        )
+        NEWS_CACHE[cache_key] = {
+            "content": content,
+            "expires_at": now_ts + max(fallback_ttl, 30),
+            "updated_at": now_ts,
+        }
+        return content
+
+
 # ── Digest V2: source ratings ────────────────────────────────────────────────
 
 
@@ -2227,6 +2441,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/fx - валюты\n"
             "/dam - Cyprus reservoirs\n"
             "/news - новостной дайджест (v1)\n"
+            "/hot - самые обсуждаемые новости (по охвату в СМИ)\n"
             "/digest - tech-дайджест с ИИ-скорингом\n"
             "/all - все блоки\n\n"
             "Авто-отправка в 08:00 и 20:00 (Кипр) отправляет /all, если в Render задана "
@@ -2297,6 +2512,21 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         include_version=True,
         force_refresh=force_refresh,
         debug_mode=debug_mode,
+        news_spoilers=True,
+    )
+    await send_rendered_update(update, text, html_mode)
+
+
+async def hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
+    force_refresh = bool(
+        context.args and context.args[0].strip().lower() in {"refresh", "r", "now", "new"}
+    )
+    text, html_mode = await render_block_async(
+        block_name="hot",
+        include_version=True,
+        force_refresh=force_refresh,
         news_spoilers=True,
     )
     await send_rendered_update(update, text, html_mode)
@@ -2493,6 +2723,7 @@ async def on_startup(app) -> None:
             BotCommand("fx", "валюты"),
             BotCommand("dam", "Cyprus reservoirs"),
             BotCommand("news", "новостной дайджест (v1)"),
+            BotCommand("hot", "самые обсуждаемые новости"),
             BotCommand("digest", "tech-дайджест с ИИ-скорингом"),
             BotCommand("all", "все блоки"),
             BotCommand("status", "статус scheduler и env"),
@@ -2561,6 +2792,7 @@ def main() -> None:
     app.add_handler(CommandHandler("fx", fx))
     app.add_handler(CommandHandler("dam", dam))
     app.add_handler(CommandHandler("news", news))
+    app.add_handler(CommandHandler("hot", hot))
     app.add_handler(CommandHandler("digest", digest_cmd))
     app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler("status", status))
