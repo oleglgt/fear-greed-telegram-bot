@@ -44,10 +44,15 @@ STOOQ_EURRUB_CSV_URL = "https://stooq.com/q/l/?s=eurrub&i=1"
 WDD_RESERVOIRS_PAGE_URL = (
     "https://www.moa.gov.cy/moa/wdd/Wdd.nsf/page18_en/page18_en?opendocument"
 )
+# Fragmata aggregates the same WDD weekly reports and exposes them as JSON
+# (open API, no auth; docs: github.com/vbougay/fragmata.info API.md). The old
+# WDD Lotus Notes page stopped serving UK.xlsx after the gov.cy migration.
+FRAGMATA_SUMMARY_URL = "https://fragmata.info/api/v1/summary/"
 # Candidate sources for /dam debug probe: the old Lotus Notes WDD site is being
 # phased out in favour of the new MOA portal and the Cyprus Dams Monitor, so
 # probe all of them from production (which has open egress) to pick a new source.
 DAM_DEBUG_PROBE_URLS: list[str] = [
+    FRAGMATA_SUMMARY_URL,
     WDD_RESERVOIRS_PAGE_URL,
     "https://www.moi.gov.cy/moa/wdd/wdd.nsf/page18_en/page18_en?opendocument",
     "https://moa.gov.cy/sectors/water-resources/water-development-department/?lang=en",
@@ -61,7 +66,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v2.9.0"
+BOT_VERSION = "v2.10.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -487,7 +492,34 @@ def read_xlsx_first_sheet_rows(xlsx_bytes: bytes) -> dict[int, dict[str, object]
         return rows_data
 
 
-def fetch_cyprus_reservoirs_summary() -> str:
+def fetch_cyprus_reservoirs_fragmata() -> str:
+    response = requests.get(
+        FRAGMATA_SUMMARY_URL,
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    inflow_24h = float(data["inflowLast24h"])
+    inflow_since = float(data["inflowSinceOctober"])
+    current_mcm = float(data["totalStorage"])
+    current_pct = float(data["totalStoragePercent"])
+    last_year_mcm = float(data["lastYearStorage"])
+    last_year_pct = float(data["lastYearStoragePercent"])
+    report_date = parse_wdd_report_date(str(data.get("reportDate", "")))
+
+    return (
+        "Cyprus reservoirs:\n"
+        f"Inflow: +{inflow_24h:.3f} MCM (24h), +{inflow_since:.3f} MCM (since 1 Oct)\n"
+        f"Now: {current_mcm:.3f} MCM ({current_pct:.2f}%)\n"
+        f"Last year: {last_year_mcm:.3f} MCM ({last_year_pct:.2f}%)\n"
+        f"Report date: {report_date}\n"
+        "Source: fragmata.info (WDD weekly data)"
+    )
+
+
+def fetch_cyprus_reservoirs_wdd_xlsx() -> str:
     html = get_url_text(WDD_RESERVOIRS_PAGE_URL)
 
     # WDD sometimes serves mixed href casing/quoting/URL styles.
@@ -2046,8 +2078,13 @@ def build_fx_block() -> str:
 
 
 def build_dam_block() -> str:
+    result = _try_source("fragmata", fetch_cyprus_reservoirs_fragmata)
+    if result is not None:
+        return result
+    # Legacy WDD xlsx scrape — dead since the gov.cy migration, kept as a
+    # cheap last resort in case Fragmata goes away and the page comes back.
     try:
-        return fetch_cyprus_reservoirs_summary()
+        return fetch_cyprus_reservoirs_wdd_xlsx()
     except Exception as exc:
         return f"Cyprus reservoirs: временно недоступно ({exc})"
 
