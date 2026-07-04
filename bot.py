@@ -70,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v3.1.0"
+BOT_VERSION = "v4.0.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -148,6 +148,31 @@ HOT_RSS_FEEDS: dict[str, list[str]] = {
 }
 HOT_WINDOW_HOURS = 24
 HOT_TARGET_COUNT = 10
+
+# ── /ideas: Smart Money (13F funds + analyst consensus) ─────────────────────
+# Universe of candidates = fresh buys/adds from respected funds' 13F filings
+# (SEC EDGAR, free); the live layer = analyst strong-buy consensus per ticker
+# (Finnhub, free API key). CUSIP→ticker resolved via OpenFIGI (free, key optional).
+IDEAS_UNIVERSE_FILE = "ideas_universe.json"
+IDEAS_UNIVERSE_MAX_AGE_DAYS = 30
+IDEAS_TARGET_COUNT = 10
+IDEAS_MAX_ANALYST_LOOKUPS = 25  # Finnhub free tier is 60 req/min
+IDEAS_MIN_COVERAGE = 5  # analysts covering; below this the rating is noise
+IDEAS_CHANGE_PCT = 20.0  # shares +/-20% counts as increased/decreased
+IDEAS_CACHE: dict[str, object] = {}
+EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+EDGAR_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/"
+OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
+FINNHUB_RECO_URL = "https://finnhub.io/api/v1/stock/recommendation"
+# CIK -> fallback label; the display name is taken from EDGAR's own response.
+IDEAS_FUNDS: dict[str, str] = {
+    "0001067983": "Berkshire Hathaway",
+    "0001336528": "Pershing Square",
+    "0001040273": "Third Point",
+    "0001656456": "Appaloosa",
+    "0001061768": "Baupost Group",
+    "0001649339": "Scion Asset Management",
+}
 HOT_CATEGORY_ICONS = {"politics": "🌍", "technology": "⚡", "markets": "💹"}
 HOT_TITLE_STOPWORDS = frozenset(
     "the and for with that this from are was were has have had been will would "
@@ -332,6 +357,8 @@ def render_block(
     elif block_name == "hot":
         html_mode = news_spoilers and not debug_mode
         text = build_hot_news_block(force_refresh=force_refresh, use_spoilers=html_mode)
+    elif block_name == "ideas":
+        text = build_ideas_block(force_refresh=force_refresh)
     else:
         raise ValueError(f"Unknown block: {block_name}")
 
@@ -1914,6 +1941,408 @@ def build_hot_news_block(force_refresh: bool = False, use_spoilers: bool = False
         return content
 
 
+# ── /ideas: Smart Money (13F + analysts) ────────────────────────────────────
+
+
+def _edgar_headers() -> dict[str, str]:
+    # SEC asks automated clients to identify themselves via User-Agent.
+    ua = os.getenv(
+        "EDGAR_USER_AGENT",
+        "fear-greed-telegram-bot/1.0 (+https://github.com/oleglgt/fear-greed-telegram-bot)",
+    )
+    return {"User-Agent": ua, "Accept": "application/json,text/xml,*/*"}
+
+
+def _edgar_get(url: str) -> requests.Response:
+    time_module.sleep(0.15)  # stay far below SEC's 10 req/s limit
+    response = requests.get(url, headers=_edgar_headers(), timeout=HTTP_TIMEOUT_LONG)
+    response.raise_for_status()
+    return response
+
+
+def _fund_latest_13f_filings(cik: str) -> tuple[str, list[dict[str, str]]]:
+    """Return (fund_name, [latest filing, previous-period filing]).
+
+    Amendments (13F-HR/A) share the period with the original; per period we
+    keep the most recently filed document.
+    """
+    data = _edgar_get(EDGAR_SUBMISSIONS_URL.format(cik=cik)).json()
+    name = str(data.get("name") or IDEAS_FUNDS.get(cik, cik)).title()
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    rows = [
+        {
+            "acc": recent["accessionNumber"][i],
+            "period": recent["reportDate"][i],
+            "filed": recent["filingDate"][i],
+        }
+        for i in range(len(forms))
+        if str(forms[i]).startswith("13F-HR")
+    ]
+    by_period: dict[str, dict[str, str]] = {}
+    for row in rows:  # rows come newest-filed first
+        by_period.setdefault(row["period"], row)
+    periods = sorted(by_period, reverse=True)[:2]
+    return name, [by_period[p] for p in periods]
+
+
+def _parse_13f_infotable(xml_text: str) -> dict[str, dict[str, object]]:
+    """Aggregate a 13F information table into {cusip: {issuer, value, shares}}.
+
+    Namespace-agnostic (funds use different xmlns prefixes); derivative rows
+    (putCall) are skipped; multiple rows per CUSIP (split voting authority)
+    are summed.
+    """
+    root = ET.fromstring(xml_text)
+    holdings: dict[str, dict[str, object]] = {}
+    for table in root.iter():
+        if not table.tag.lower().endswith("infotable"):
+            continue
+        fields: dict[str, str] = {}
+        for child in table.iter():
+            tag = child.tag.rsplit("}", 1)[-1].lower()
+            if child.text and child.text.strip() and tag not in fields:
+                fields[tag] = child.text.strip()
+        if fields.get("putcall"):
+            continue
+        cusip = fields.get("cusip", "").upper()
+        if not cusip:
+            continue
+        try:
+            value = float(fields.get("value", "0"))
+        except ValueError:
+            value = 0.0
+        try:
+            shares = float(fields.get("sshprnamt", "0"))
+        except ValueError:
+            shares = 0.0
+        entry = holdings.setdefault(
+            cusip, {"issuer": fields.get("nameofissuer", cusip), "value": 0.0, "shares": 0.0}
+        )
+        entry["value"] = float(entry["value"]) + value
+        entry["shares"] = float(entry["shares"]) + shares
+    return holdings
+
+
+def _fetch_13f_holdings(cik: str, acc: str) -> dict[str, dict[str, object]]:
+    base = EDGAR_ARCHIVES_URL.format(cik_int=str(int(cik)), acc=acc.replace("-", ""))
+    index = _edgar_get(base + "index.json").json()
+    xml_name = None
+    for item in index.get("directory", {}).get("item", []):
+        low = str(item.get("name", "")).lower()
+        if not low.endswith(".xml") or "primary_doc" in low:
+            continue
+        xml_name = item["name"]
+        if "infotable" in low or "form13f" in low:
+            break
+    if not xml_name:
+        raise ValueError(f"13F info table xml not found in {base}")
+    return _parse_13f_infotable(_edgar_get(base + xml_name).text)
+
+
+def _diff_13f(
+    cur: dict[str, dict[str, object]], prev: dict[str, dict[str, object]]
+) -> tuple[list[dict], list[dict]]:
+    buys: list[dict] = []
+    sells: list[dict] = []
+    for cusip, cur_e in cur.items():
+        prev_e = prev.get(cusip)
+        if prev_e is None:
+            buys.append({"cusip": cusip, **cur_e, "action": "new", "pct": None})
+            continue
+        prev_shares = float(prev_e.get("shares", 0.0))
+        if prev_shares <= 0:
+            continue
+        pct = (float(cur_e["shares"]) - prev_shares) / prev_shares * 100
+        if pct >= IDEAS_CHANGE_PCT:
+            buys.append({"cusip": cusip, **cur_e, "action": "increased", "pct": pct})
+        elif pct <= -IDEAS_CHANGE_PCT:
+            sells.append({"cusip": cusip, **cur_e, "action": "decreased", "pct": pct})
+    for cusip, prev_e in prev.items():
+        if cusip not in cur:
+            sells.append({"cusip": cusip, **prev_e, "action": "exited", "pct": None})
+    return buys, sells
+
+
+def _map_cusips_to_tickers(cusips: list[str]) -> dict[str, str]:
+    api_key = os.getenv("OPENFIGI_API_KEY", "").strip()
+    headers = {"Content-Type": "application/json"}
+    batch_size = 100 if api_key else 8
+    if api_key:
+        headers["X-OPENFIGI-APIKEY"] = api_key
+    out: dict[str, str] = {}
+    for start in range(0, len(cusips), batch_size):
+        chunk = cusips[start : start + batch_size]
+        jobs = [{"idType": "ID_CUSIP", "idValue": c, "exchCode": "US"} for c in chunk]
+        try:
+            response = requests.post(
+                OPENFIGI_MAPPING_URL, json=jobs, headers=headers, timeout=HTTP_TIMEOUT_SHORT
+            )
+            if response.status_code == 429:
+                time_module.sleep(15)
+                response = requests.post(
+                    OPENFIGI_MAPPING_URL, json=jobs, headers=headers, timeout=HTTP_TIMEOUT_SHORT
+                )
+            response.raise_for_status()
+            for cusip, result in zip(chunk, response.json()):
+                rows = result.get("data") or []
+                ticker = str(rows[0].get("ticker", "")).strip() if rows else ""
+                if ticker:
+                    out[cusip] = ticker
+        except Exception as exc:
+            logger.warning("openfigi batch %d failed: %s", start // batch_size + 1, exc)
+        time_module.sleep(0.3 if api_key else 3.0)  # free tier: 25 req/min
+    return out
+
+
+def build_ideas_universe() -> dict:
+    """Rebuild the candidate universe from the funds' two latest 13F filings."""
+    candidates: dict[str, dict] = {}
+    exits: dict[str, dict] = {}
+    funds_meta: list[dict[str, str]] = []
+    for cik, label in IDEAS_FUNDS.items():
+        try:
+            name, filings = _fund_latest_13f_filings(cik)
+            if len(filings) < 2:
+                logger.warning("ideas: %s has <2 13F periods, skipped", label)
+                continue
+            cur = _fetch_13f_holdings(cik, filings[0]["acc"])
+            prev = _fetch_13f_holdings(cik, filings[1]["acc"])
+            buys, sells = _diff_13f(cur, prev)
+            funds_meta.append({"name": name, "period": filings[0]["period"]})
+            for row in buys:
+                c = candidates.setdefault(
+                    row["cusip"], {"issuer": row["issuer"], "actions": []}
+                )
+                c["actions"].append(
+                    {"fund": name, "action": row["action"], "pct": row["pct"], "value": row["value"]}
+                )
+            for row in sells:
+                e = exits.setdefault(row["cusip"], {"issuer": row["issuer"], "actions": []})
+                e["actions"].append({"fund": name, "action": row["action"], "pct": row["pct"]})
+        except Exception as exc:
+            logger.warning("ideas: fund %s (CIK %s) failed: %s", label, cik, exc)
+    if not candidates:
+        raise ValueError("13F: не удалось собрать покупки ни одного фонда")
+
+    tickers = _map_cusips_to_tickers(list(candidates) + [c for c in exits if c not in candidates])
+    for cusip, entry in list(candidates.items()) + list(exits.items()):
+        entry["ticker"] = tickers.get(cusip, "")
+
+    universe = {
+        "built_at": datetime.now(timezone.utc).timestamp(),
+        "funds": funds_meta,
+        "candidates": candidates,
+        "exits": exits,
+    }
+    with STATE_LOCK:
+        atomic_write_json(IDEAS_UNIVERSE_FILE, universe)
+    return universe
+
+
+def load_ideas_universe() -> dict | None:
+    try:
+        with open(IDEAS_UNIVERSE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and data.get("candidates") else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _fetch_finnhub_recommendation(ticker: str) -> dict | None:
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+    response = requests.get(
+        FINNHUB_RECO_URL,
+        params={"symbol": ticker, "token": api_key},
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or not rows:
+        return None
+    latest = rows[0]
+    baseline = rows[3] if len(rows) > 3 else rows[-1]
+    sb = int(latest.get("strongBuy", 0))
+    return {
+        "strong_buy": sb,
+        "buy": int(latest.get("buy", 0)),
+        "hold": int(latest.get("hold", 0)),
+        "sell": int(latest.get("sell", 0)) + int(latest.get("strongSell", 0)),
+        "momentum": sb - int(baseline.get("strongBuy", 0)),
+    }
+
+
+def _score_idea(actions: list[dict], reco: dict | None) -> tuple[int, float | None]:
+    """Return (score 0-100, strong_buy_ratio_or_None)."""
+    fund_score = 0.0
+    for action in actions:
+        fund_score += 25.0 if action.get("action") == "new" else 15.0
+    fund_score = min(fund_score, 50.0)
+
+    analyst_score = 0.0
+    ratio: float | None = None
+    if reco:
+        coverage = reco["strong_buy"] + reco["buy"] + reco["hold"] + reco["sell"]
+        if coverage >= IDEAS_MIN_COVERAGE:
+            ratio = reco["strong_buy"] / coverage
+            momentum = max(-1.0, min(reco["momentum"] / 5.0, 1.0))
+            analyst_score = max(0.0, min(ratio * 35.0 + momentum * 15.0, 50.0))
+    return round(fund_score + analyst_score), ratio
+
+
+def _fmt_usd(value: float) -> str:
+    if value >= 1e9:
+        return f"${value / 1e9:.1f}B"
+    if value >= 1e6:
+        return f"${value / 1e6:.0f}M"
+    return f"${value:,.0f}"
+
+
+def _fmt_fund_action(action: dict) -> str:
+    fund = action.get("fund", "?")
+    kind = action.get("action")
+    pct = action.get("pct")
+    value = float(action.get("value") or 0.0)
+    if kind == "new":
+        label = "новая позиция"
+    elif kind == "increased":
+        label = f"+{pct:.0f}%"
+    elif kind == "decreased":
+        label = f"{pct:.0f}%"
+    else:
+        label = "вышел"
+    if value > 0 and kind in {"new", "increased"}:
+        label += f" (~{_fmt_usd(value)})"
+    return f"{fund}: {label}"
+
+
+def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str:
+    ttl = int(os.getenv("IDEAS_CACHE_TTL_SECONDS", "21600"))
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached_entry = IDEAS_CACHE.get("block")
+    if (
+        not force_refresh
+        and not rebuild
+        and isinstance(cached_entry, dict)
+        and cached_entry.get("content")
+        and float(cached_entry.get("expires_at", 0.0)) > now_ts
+    ):
+        return str(cached_entry["content"])
+
+    try:
+        universe = None if rebuild else load_ideas_universe()
+        max_age = IDEAS_UNIVERSE_MAX_AGE_DAYS * 86400
+        if universe is None or now_ts - float(universe.get("built_at", 0)) > max_age:
+            universe = build_ideas_universe()
+
+        candidates = universe.get("candidates", {})
+        exits = universe.get("exits", {})
+
+        # Analyst layer for the biggest fund bets only (Finnhub free tier).
+        ranked = sorted(
+            candidates.items(),
+            key=lambda kv: max(float(a.get("value") or 0.0) for a in kv[1]["actions"]),
+            reverse=True,
+        )[:IDEAS_MAX_ANALYST_LOOKUPS]
+        finnhub_on = bool(os.getenv("FINNHUB_API_KEY", "").strip())
+        scored = []
+        for cusip, entry in ranked:
+            ticker = str(entry.get("ticker", ""))
+            reco = None
+            if ticker and finnhub_on:
+                try:
+                    reco = _fetch_finnhub_recommendation(ticker)
+                except Exception as exc:
+                    logger.warning("finnhub %s failed: %s", ticker, exc)
+                time_module.sleep(1.05)  # 60 req/min free limit
+            score, ratio = _score_idea(entry["actions"], reco)
+            scored.append((score, ratio, ticker, entry, reco))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        lines = ["💡 Smart Money Ideas (13F китов + аналитики):", ""]
+        for idx, (score, ratio, ticker, entry, reco) in enumerate(
+            scored[:IDEAS_TARGET_COUNT], 1
+        ):
+            name = ticker or str(entry.get("issuer", "?")).title()
+            icon = "🤝" if (ratio is not None and ratio >= 0.4) else "🐋"
+            lines.append(f"{idx}. {icon} {name} — {score}")
+            for action in entry["actions"][:3]:
+                lines.append(f"   🐋 {_fmt_fund_action(action)}")
+            if reco:
+                coverage = reco["strong_buy"] + reco["buy"] + reco["hold"] + reco["sell"]
+                mom = reco["momentum"]
+                mom_part = f", {'+' if mom >= 0 else ''}{mom} SB за 3 мес" if mom else ""
+                if coverage >= IDEAS_MIN_COVERAGE:
+                    lines.append(
+                        f"   📈 {reco['strong_buy']} strongBuy / {reco['buy']} buy / "
+                        f"{reco['hold']} hold / {reco['sell']} sell{mom_part}"
+                    )
+                else:
+                    lines.append(f"   📈 мало покрытия ({coverage} аналитиков)")
+            elif not finnhub_on:
+                lines.append("   📈 аналитика выкл (нет FINNHUB_API_KEY)")
+            elif not ticker:
+                lines.append("   📈 тикер не определён (CUSIP без маппинга)")
+            lines.append("")
+
+        exit_rows = []
+        for entry in exits.values():
+            name = str(entry.get("ticker") or "") or str(entry.get("issuer", "?")).title()
+            first = entry["actions"][0]
+            exit_rows.append(f"{name} ({_fmt_fund_action(first)})")
+        if exit_rows:
+            lines.append("⚠️ Киты сокращают/выходят: " + "; ".join(exit_rows[:3]))
+            lines.append("")
+
+        period = universe.get("funds", [{}])[0].get("period", "?") if universe.get("funds") else "?"
+        fund_names = ", ".join(f["name"] for f in universe.get("funds", []))
+        built = format_cyprus_date(
+            datetime.fromtimestamp(float(universe.get("built_at", now_ts)), tz=timezone.utc)
+        )
+        lines.append(f"13F за {period}, вселенная обновлена {built}. Фонды: {fund_names}")
+        lines.append("Не инвестиционная рекомендация.")
+        content = "\n".join(lines)
+        IDEAS_CACHE["block"] = {"content": content, "expires_at": now_ts + max(ttl, 300)}
+        return content
+    except Exception as exc:
+        logger.exception("ideas block failed")
+        return f"Smart Money Ideas: временно недоступно ({exc})"
+
+
+def build_ideas_debug_block() -> str:
+    lines = ["Ideas sources probe:"]
+    universe = load_ideas_universe()
+    if universe:
+        age_h = (datetime.now(timezone.utc).timestamp() - float(universe.get("built_at", 0))) / 3600
+        lines.append(
+            f"• universe: {len(universe.get('candidates', {}))} candidates, "
+            f"{len(universe.get('exits', {}))} exits, age {age_h:.0f}h"
+        )
+    else:
+        lines.append("• universe: not built yet")
+    first_cik = next(iter(IDEAS_FUNDS))
+    try:
+        name, filings = _fund_latest_13f_filings(first_cik)
+        lines.append(f"• EDGAR {name}: OK, periods {[f['period'] for f in filings]}")
+    except Exception as exc:
+        lines.append(f"• EDGAR FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    try:
+        mapped = _map_cusips_to_tickers(["037833100"])  # Apple Inc
+        lines.append(f"• OpenFIGI: {mapped or 'empty (check rate limit)'}")
+    except Exception as exc:
+        lines.append(f"• OpenFIGI FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    if os.getenv("FINNHUB_API_KEY", "").strip():
+        try:
+            lines.append(f"• Finnhub AAPL: {_fetch_finnhub_recommendation('AAPL')}")
+        except Exception as exc:
+            lines.append(f"• Finnhub FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    else:
+        lines.append("• Finnhub: FINNHUB_API_KEY не задан (аналитический слой выключен)")
+    return "\n".join(lines)
+
+
 # ── Digest V2: source ratings ────────────────────────────────────────────────
 
 
@@ -2473,6 +2902,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/news - новостной дайджест (v1)\n"
             "/hot - самые обсуждаемые новости (по охвату в СМИ)\n"
             "/digest - tech-дайджест с ИИ-скорингом\n"
+            "/ideas - Smart Money: покупки фондов (13F) + strong buy аналитиков\n"
             "/all - все блоки\n\n"
             "Авто-отправка в 08:00 и 20:00 (Кипр) отправляет /all, если в Render задана "
             "переменная TELEGRAM_TARGET_CHAT_ID."
@@ -2562,10 +2992,43 @@ async def hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_rendered_update(update, text, html_mode)
 
 
+async def ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _check_access(update):
+        return
+    arg = context.args[0].strip().lower() if context.args else ""
+    loop = asyncio.get_running_loop()
+    if arg in {"debug", "dbg", "probe"}:
+        try:
+            text = await loop.run_in_executor(None, build_ideas_debug_block)
+        except Exception as exc:
+            logger.exception("ideas debug probe crashed")
+            text = f"Ideas sources probe: ошибка ({exc})"
+        await reply_long_text(update, with_version(text))
+        return
+    message = update.effective_message
+    wait_msg = None
+    if message is not None and arg in {"rebuild", "refresh", "r"}:
+        wait_msg = await message.reply_text("⏳ Собираю Smart Money Ideas...")
+    text = await loop.run_in_executor(
+        None,
+        partial(
+            build_ideas_block,
+            force_refresh=arg in {"rebuild", "refresh", "r"},
+            rebuild=arg == "rebuild",
+        ),
+    )
+    if wait_msg is not None:
+        try:
+            await wait_msg.delete()
+        except Exception as exc:
+            logger.debug("ideas wait message delete failed: %s", exc)
+    await reply_long_text(update, with_version(text))
+
+
 async def all_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_access(update):
         return
-    block_order = ["fg", "st", "fx", "dam", "news"]
+    block_order = ["fg", "st", "fx", "dam", "news", "ideas"]
     for idx, block_name in enumerate(block_order):
         text, html_mode = await render_block_async(
             block_name=block_name,
@@ -2601,7 +3064,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    block_order = ["fg", "st", "fx", "dam", "news"]
+    block_order = ["fg", "st", "fx", "dam", "news", "ideas"]
     for idx, block_name in enumerate(block_order):
         text, html_mode = await render_block_async(
             block_name=block_name,
@@ -2755,6 +3218,7 @@ async def on_startup(app) -> None:
             BotCommand("news", "новостной дайджест (v1)"),
             BotCommand("hot", "самые обсуждаемые новости"),
             BotCommand("digest", "tech-дайджест с ИИ-скорингом"),
+            BotCommand("ideas", "Smart Money: 13F + strong buy"),
             BotCommand("all", "все блоки"),
             BotCommand("status", "статус scheduler и env"),
         ]
@@ -2824,6 +3288,7 @@ def main() -> None:
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("hot", hot))
     app.add_handler(CommandHandler("digest", digest_cmd))
+    app.add_handler(CommandHandler("ideas", ideas))
     app.add_handler(CommandHandler("all", all_report))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CallbackQueryHandler(digest_reaction_callback, pattern=r"^dr2?:"))

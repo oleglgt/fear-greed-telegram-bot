@@ -5,4 +5,5 @@ bot_state.json
 news_history.json
 source_ratings.json
 sent_digests.json
+ideas_universe.json
 *.json.tmp
