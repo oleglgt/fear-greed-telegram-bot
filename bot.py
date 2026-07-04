@@ -70,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.0.0"
+BOT_VERSION = "v4.0.1"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -2100,6 +2100,7 @@ def build_ideas_universe() -> dict:
     candidates: dict[str, dict] = {}
     exits: dict[str, dict] = {}
     funds_meta: list[dict[str, str]] = []
+    last_error: Exception | None = None
     for cik, label in IDEAS_FUNDS.items():
         try:
             name, filings = _fund_latest_13f_filings(cik)
@@ -2121,9 +2122,13 @@ def build_ideas_universe() -> dict:
                 e = exits.setdefault(row["cusip"], {"issuer": row["issuer"], "actions": []})
                 e["actions"].append({"fund": name, "action": row["action"], "pct": row["pct"]})
         except Exception as exc:
+            last_error = exc
             logger.warning("ideas: fund %s (CIK %s) failed: %s", label, cik, exc)
     if not candidates:
-        raise ValueError("13F: не удалось собрать покупки ни одного фонда")
+        raise ValueError(
+            f"13F: не удалось собрать покупки ни одного фонда; "
+            f"последняя ошибка: {type(last_error).__name__}: {str(last_error)[:180]}"
+        )
 
     tickers = _map_cusips_to_tickers(list(candidates) + [c for c in exits if c not in candidates])
     for cusip, entry in list(candidates.items()) + list(exits.items()):
