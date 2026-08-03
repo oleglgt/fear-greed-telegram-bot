@@ -70,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.2.0"
+BOT_VERSION = "v4.3.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -95,8 +95,30 @@ ALLOWED_USER_ID: int | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {}
-NEWS_TARGETS: list[tuple[str, int]] = [("ai", 10), ("finance", 8), ("robotics", 7)]
-NEWS_CATEGORY_LABELS = {"ai": "AI", "finance": "Finance", "robotics": "Robotics"}
+NEWS_TARGETS: list[tuple[str, int]] = [
+    ("ai", 10),
+    ("agentpay", 5),
+    ("finance", 8),
+    ("robotics", 7),
+]
+NEWS_CATEGORY_LABELS = {
+    "ai": "AI",
+    "agentpay": "AI Payments",
+    "finance": "Finance",
+    "robotics": "Robotics",
+}
+# Feeds for agentpay are broad fintech/payments streams, so items must also
+# match this topical filter to qualify as AI-agent-payments news.
+AGENTPAY_KEYWORD_RE = re.compile(
+    r"agentic\s+(commerce|payments?|checkout|shopping|transactions?|spending|banking)"
+    r"|agent\s+payments?\s+protocol|\bAP2\b|\bx402\b|agentic\s+commerce\s+protocol|\bACP\b"
+    r"|\b(ai|autonomous|shopping)\s+agents?\b.{0,60}\b(pay(s|ment|ments)?|purchas\w+|buy(s|ing)?|"
+    r"checkout|commerce|transactions?|wallets?|stablecoins?|credit\s+cards?)\b"
+    r"|\b(pay(ment|ments)?|commerce|checkout|wallets?|stablecoins?|banks?|banking|fintech)\b"
+    r".{0,60}\b(ai|autonomous)\s+agents?\b",
+    re.IGNORECASE,
+)
+AGENTPAY_WINDOW_HOURS = 48  # niche topic: a 24h window often yields too few items
 MAX_TELEGRAM_MESSAGE_LEN = 3900
 HTTP_TIMEOUT_SHORT = 15  # market/FX APIs
 HTTP_TIMEOUT_LONG = 30  # RSS feeds, XLSX downloads
@@ -119,6 +141,12 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
         "https://www.therobotreport.com/feed/",
         "https://techcrunch.com/tag/robotics/feed/",
         "https://news.mit.edu/rss/topic/robotics",
+    ],
+    "agentpay": [
+        "https://hnrss.org/newest?q=%22agentic+commerce%22+OR+%22agentic+payments%22+OR+%22agent+payments%22+OR+x402+OR+AP2",
+        "https://www.pymnts.com/feed/",
+        "https://thefintechtimes.com/feed/",
+        "https://techcrunch.com/category/fintech/feed/",
     ],
 }
 
@@ -1676,7 +1704,6 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     now_utc_dt = datetime.now(timezone.utc)
     now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_ts = now_utc_dt.timestamp()
-    cutoff = now_ts - 24 * 3600
     history = prune_news_history(load_news_history(), now_ts)
     by_category: dict[str, list[dict[str, str]]] = {k: [] for k, _ in NEWS_TARGETS}
     seen: set[str] = set()
@@ -1685,9 +1712,14 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
         debug_logs.append(f"UTC now: {now_utc}")
         debug_logs.append(f"History: {len(history)} items in last {NEWS_HISTORY_HOURS}h")
         debug_logs.append("Cache: miss (forced live fetch)")
-    for category, count in NEWS_TARGETS:
+    # Niche agentpay goes first: its stories also appear in the broad AI feeds,
+    # and whichever category collects an item first wins via the dedup set.
+    fetch_order = sorted(NEWS_TARGETS, key=lambda t: t[0] != "agentpay")
+    for category, count in fetch_order:
+        window_hours = AGENTPAY_WINDOW_HOURS if category == "agentpay" else 24
+        cutoff = now_ts - window_hours * 3600
         if debug_mode:
-            debug_logs.append(f"RSS: category {category} target {count}")
+            debug_logs.append(f"RSS: category {category} target {count} window {window_hours}h")
         feeds = NEWS_RSS_FEEDS.get(category, [])
         collected: list[dict[str, str]] = []
         for feed_url in feeds:
@@ -1696,6 +1728,14 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
             try:
                 xml_text = get_url_text(feed_url)
                 feed_items = parse_news_feed_items(xml_text, category, feed_url)
+                if category == "agentpay":
+                    feed_items = [
+                        item
+                        for item in feed_items
+                        if AGENTPAY_KEYWORD_RE.search(
+                            f"{item['headline_en']} {item['details_en']}"
+                        )
+                    ]
                 fresh_items: list[dict[str, str]] = []
                 for item in feed_items:
                     published_raw = item.pop("_published_dt", "")
@@ -1778,7 +1818,8 @@ def build_news_block(
             lines.append("News digest:")
         else:
             lines = ["News digest:"]
-        for item in ai_items[:25]:
+        max_items = sum(count for _, count in NEWS_TARGETS)
+        for item in ai_items[:max_items]:
             raw_cat = item.get("category", "news")
             cat = NEWS_CATEGORY_LABELS.get(raw_cat, raw_cat.capitalize())
             expanded_details = format_expanded_details(item)
