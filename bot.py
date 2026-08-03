@@ -70,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.0.1"
+BOT_VERSION = "v4.1.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -1437,14 +1437,63 @@ def parse_json_payload(text: str) -> object:
     return json.loads(payload)
 
 
-def translate_news_best_effort(
+def fetch_article_text(url: str) -> str:
+    """Best-effort extraction of the article body for AI summarization."""
+    max_chars = int(os.getenv("NEWS_ARTICLE_MAX_CHARS", "4000"))
+    timeout_seconds = int(os.getenv("NEWS_ARTICLE_FETCH_TIMEOUT_SECONDS", "8"))
+    try:
+        response = requests.get(
+            url, headers=REQUEST_HEADERS_GENERIC, timeout=timeout_seconds
+        )
+        response.raise_for_status()
+        html = response.text
+    except Exception as exc:
+        logger.debug("fetch_article_text failed for %s: %s", url, exc)
+        return ""
+    html = re.sub(r"(?is)<(script|style|noscript|svg|form)[^>]*>.*?</\1>", " ", html)
+    chunks: list[str] = []
+    total = 0
+    for paragraph in re.findall(r"(?is)<p[^>]*>(.*?)</p>", html):
+        text = normalize_text(unescape(re.sub(r"(?s)<[^>]+>", " ", paragraph)))
+        # Short fragments are almost always menus, captions or cookie banners.
+        if len(text) < 60:
+            continue
+        chunks.append(text)
+        total += len(text)
+        if total >= max_chars:
+            break
+    return " ".join(chunks)[:max_chars]
+
+
+def attach_article_texts(items: list[dict[str, str]]) -> int:
+    """Fetch article bodies concurrently into item['_article_en']. Returns hit count."""
+    if os.getenv("NEWS_SUMMARY_FETCH_ARTICLES", "1").strip() != "1":
+        return 0
+    targets = [item for item in items if item.get("url") and not item.get("_article_en")]
+    if not targets:
+        return 0
+    workers = max(1, min(int(os.getenv("NEWS_ARTICLE_FETCH_WORKERS", "6")), 12))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        texts = list(pool.map(lambda item: fetch_article_text(item["url"]), targets))
+    fetched = 0
+    for item, text in zip(targets, texts):
+        if text:
+            item["_article_en"] = text
+            fetched += 1
+    return fetched
+
+
+def summarize_news_best_effort(
     items: list[dict[str, str]], debug_logs: list[str] | None = None
 ) -> None:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key or not items:
         if debug_logs is not None:
-            debug_logs.append("Translation: skipped (no OPENAI_API_KEY or empty list)")
+            debug_logs.append("Summary: skipped (no OPENAI_API_KEY or empty list)")
         return
+    fetched = attach_article_texts(items)
+    if debug_logs is not None:
+        debug_logs.append(f"Article fetch: {fetched}/{len(items)} bodies")
     batch_size = int(os.getenv("NEWS_TRANSLATE_BATCH_SIZE", "5"))
     batch_size = max(1, min(batch_size, 10))
     translated_any = False
@@ -1455,6 +1504,7 @@ def translate_news_best_effort(
                 "id": idx + start,
                 "headline_en": item["headline_en"],
                 "details_en": item["details_en"],
+                "article_en": item.get("_article_en", ""),
             }
             for idx, item in enumerate(batch)
         ]
@@ -1462,12 +1512,18 @@ def translate_news_best_effort(
             {
                 "role": "system",
                 "content": (
-                    "Translate news fields from English to Russian. "
+                    "You are a news editor. For each item write a Russian summary "
+                    "based on article_en (the article body). "
                     "Return strict JSON only with schema: "
                     '{"items":[{"id":0,"headline_ru":"","details_ru":""}]}. '
-                    "headline_ru should be short and natural. "
-                    "details_ru should be informative and concise, formatted as 8-10 short lines "
-                    "separated by newline characters. Do not add markdown."
+                    "headline_ru: short natural Russian headline. "
+                    "details_ru: a factual retelling of the story in Russian, 3-6 short "
+                    "lines separated by newline characters, covering the concrete facts "
+                    "(who, what, where, when, numbers) from article_en. "
+                    "Use only facts stated in the provided fields. Never invent details "
+                    "and never pad with generic filler sentences. If article_en is empty, "
+                    "translate headline_en and details_en as-is; details_ru may then be "
+                    "1-2 lines. Do not add markdown."
                 ),
             },
             {
@@ -1479,7 +1535,7 @@ def translate_news_best_effort(
             text = call_openai_chat(
                 messages,
                 temperature=0.0,
-                stage_label=f"news translation batch {start // batch_size + 1}",
+                stage_label=f"news summary batch {start // batch_size + 1}",
             )
             raw = parse_json_payload(text)
             if not isinstance(raw, dict):
@@ -1507,10 +1563,10 @@ def translate_news_best_effort(
                 translated_any = True
         except Exception as exc:
             if debug_logs is not None:
-                debug_logs.append(f"Translation batch failed ({exc})")
+                debug_logs.append(f"Summary batch failed ({exc})")
             continue
     if debug_logs is not None:
-        debug_logs.append("Translation: done" if translated_any else "Translation: skipped")
+        debug_logs.append("Summary: done" if translated_any else "Summary: skipped")
 
 
 def format_expanded_details(item: dict[str, str]) -> str:
@@ -1671,7 +1727,7 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     for category, count in NEWS_TARGETS:
         final_items.extend(by_category[category][:count])
 
-    translate_news_best_effort(final_items, debug_logs if debug_mode else None)
+    summarize_news_best_effort(final_items, debug_logs if debug_mode else None)
 
     if debug_mode:
         debug_logs.append(
@@ -1886,7 +1942,7 @@ def build_hot_news_block(force_refresh: bool = False, use_spoilers: bool = False
         reps = [
             max(c["items"], key=lambda x: float(x.get("_ts", "0"))) for c in top
         ]
-        translate_news_best_effort(reps)
+        summarize_news_best_effort(reps)
 
         lines = [f"🔥 Самые обсуждаемые ({HOT_WINDOW_HOURS}ч):", ""]
         for idx, (cluster, rep) in enumerate(zip(top, reps), 1):
