@@ -70,7 +70,7 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.1.0"
+BOT_VERSION = "v4.2.0"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -95,25 +95,30 @@ ALLOWED_USER_ID: int | None = None
 CYPRUS_TZ = ZoneInfo("Europe/Nicosia")
 SCHEDULER_STATUS = "not-initialized"
 NEWS_CACHE: dict[str, object] = {}
-NEWS_TARGETS: list[tuple[str, int]] = [("politics", 5), ("technology", 10), ("markets", 10)]
+NEWS_TARGETS: list[tuple[str, int]] = [("ai", 10), ("finance", 8), ("robotics", 7)]
+NEWS_CATEGORY_LABELS = {"ai": "AI", "finance": "Finance", "robotics": "Robotics"}
 MAX_TELEGRAM_MESSAGE_LEN = 3900
 HTTP_TIMEOUT_SHORT = 15  # market/FX APIs
 HTTP_TIMEOUT_LONG = 30  # RSS feeds, XLSX downloads
+# Finance = markets/economy/company news; deliberately no MarketWatch-style
+# personal-finance feeds (tax tips, retirement advice for US consumers).
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
-    "politics": [
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "https://www.theguardian.com/world/rss",
+    "ai": [
+        "https://techcrunch.com/category/artificial-intelligence/feed/",
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+        "https://venturebeat.com/category/ai/feed/",
+        "https://news.mit.edu/rss/topic/artificial-intelligence2",
     ],
-    "technology": [
-        "https://techcrunch.com/feed/",
-        "https://www.theverge.com/rss/index.xml",
-        "https://feeds.arstechnica.com/arstechnica/index",
-    ],
-    "markets": [
-        "https://www.marketwatch.com/rss/topstories",
+    "finance": [
         "https://feeds.bbci.co.uk/news/business/rss.xml",
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.theguardian.com/uk/business/rss",
+    ],
+    "robotics": [
+        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
+        "https://www.therobotreport.com/feed/",
+        "https://techcrunch.com/tag/robotics/feed/",
+        "https://news.mit.edu/rss/topic/robotics",
     ],
 }
 
@@ -122,28 +127,27 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
 # different feeds are clustered, clusters ranked by distinct source count.
 # Wider feed pool than /news so the coverage signal has something to measure.
 HOT_RSS_FEEDS: dict[str, list[str]] = {
-    "politics": [
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "https://www.theguardian.com/world/rss",
-        "https://www.aljazeera.com/xml/rss/all.xml",
-        "https://feeds.skynews.com/feeds/rss/world.xml",
-        "https://www.france24.com/en/rss",
+    "ai": [
+        "https://techcrunch.com/category/artificial-intelligence/feed/",
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+        "https://venturebeat.com/category/ai/feed/",
+        "https://news.mit.edu/rss/topic/artificial-intelligence2",
+        "https://feeds.arstechnica.com/arstechnica/technology-lab",
+        "https://www.wired.com/feed/tag/ai/latest/rss",
     ],
-    "technology": [
-        "https://techcrunch.com/feed/",
-        "https://www.theverge.com/rss/index.xml",
-        "https://feeds.arstechnica.com/arstechnica/index",
-        "https://www.engadget.com/rss.xml",
-        "https://feeds.bbci.co.uk/news/technology/rss.xml",
-        "https://www.wired.com/feed/rss",
-    ],
-    "markets": [
-        "https://www.marketwatch.com/rss/topstories",
+    "finance": [
         "https://feeds.bbci.co.uk/news/business/rss.xml",
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
         "https://www.theguardian.com/uk/business/rss",
         "https://fortune.com/feed/",
+        "https://finance.yahoo.com/news/rssindex",
+    ],
+    "robotics": [
+        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
+        "https://www.therobotreport.com/feed/",
+        "https://techcrunch.com/tag/robotics/feed/",
+        "https://news.mit.edu/rss/topic/robotics",
+        "https://robohub.org/feed/",
     ],
 }
 HOT_WINDOW_HOURS = 24
@@ -173,7 +177,7 @@ IDEAS_FUNDS: dict[str, str] = {
     "0001061768": "Baupost Group",
     "0001649339": "Scion Asset Management",
 }
-HOT_CATEGORY_ICONS = {"politics": "🌍", "technology": "⚡", "markets": "💹"}
+HOT_CATEGORY_ICONS = {"ai": "🤖", "finance": "💹", "robotics": "🦾"}
 HOT_TITLE_STOPWORDS = frozenset(
     "the and for with that this from are was were has have had been will would "
     "could should say says said after amid over under about into more than "
@@ -1730,13 +1734,8 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     summarize_news_best_effort(final_items, debug_logs if debug_mode else None)
 
     if debug_mode:
-        debug_logs.append(
-            "Final items: "
-            f"p={len(by_category['politics'])}, "
-            f"t={len(by_category['technology'])}, "
-            f"m={len(by_category['markets'])}, "
-            f"total={len(final_items)}"
-        )
+        counts = ", ".join(f"{cat}={len(by_category[cat])}" for cat, _ in NEWS_TARGETS)
+        debug_logs.append(f"Final items: {counts}, total={len(final_items)}")
 
     if not final_items:
         raise NewsFetchError("No fresh RSS items from last 24h", debug_logs)
@@ -1780,7 +1779,8 @@ def build_news_block(
         else:
             lines = ["News digest:"]
         for item in ai_items[:25]:
-            cat = item.get("category", "news").capitalize()
+            raw_cat = item.get("category", "news")
+            cat = NEWS_CATEGORY_LABELS.get(raw_cat, raw_cat.capitalize())
             expanded_details = format_expanded_details(item)
             if use_spoilers and not debug_mode:
                 lines.append(
