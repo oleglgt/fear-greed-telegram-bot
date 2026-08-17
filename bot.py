@@ -3,7 +3,9 @@ import logging
 import os
 import io
 import json
+import platform
 import re
+import socket
 import textwrap
 import threading
 import time as time_module
@@ -70,7 +72,35 @@ OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.3.0"
+BOT_VERSION = "v4.4.0"
+BOT_STARTED_AT = datetime.now(timezone.utc)
+
+# Env markers the common hosting platforms inject; lets /status answer
+# "where is this bot actually running?".
+HOSTING_ENV_MARKERS = [
+    ("RENDER_SERVICE_NAME", "Render"),
+    ("RENDER", "Render"),
+    ("RAILWAY_PROJECT_NAME", "Railway"),
+    ("RAILWAY_ENVIRONMENT", "Railway"),
+    ("DYNO", "Heroku"),
+    ("FLY_APP_NAME", "Fly.io"),
+    ("KOYEB_APP_NAME", "Koyeb"),
+    ("PYTHONANYWHERE_DOMAIN", "PythonAnywhere"),
+    ("WEBSITE_SITE_NAME", "Azure App Service"),
+    ("K_SERVICE", "Google Cloud Run"),
+    ("AWS_EXECUTION_ENV", "AWS"),
+]
+
+
+def detect_hosting() -> str:
+    hits: dict[str, str] = {}
+    for var, label in HOSTING_ENV_MARKERS:
+        value = os.getenv(var, "").strip()
+        if value and label not in hits:
+            hits[label] = f"{label} ({var}={value})"
+    if hits:
+        return "; ".join(hits.values())
+    return "no PaaS markers (plain VM/desktop?)"
 REQUEST_HEADERS_CNN = {
     # CNN often blocks non-browser default clients (python-requests).
     "User-Agent": (
@@ -3150,9 +3180,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
     job_names = ", ".join(job.name for job in jobs) if jobs else "(none)"
+    uptime = datetime.now(timezone.utc) - BOT_STARTED_AT
+    uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds % 3600) // 60}m"
     await update.effective_message.reply_text(
         with_version(
             "Статус бота:\n"
+            f"- Host: {socket.gethostname()}\n"
+            f"- OS: {platform.platform(terse=True)}\n"
+            f"- Hosting: {detect_hosting()}\n"
+            f"- Started: {format_cyprus_time(BOT_STARTED_AT)} (up {uptime_str})\n"
             f"- Scheduler: {SCHEDULER_STATUS}\n"
             f"- job_queue available: {has_job_queue}\n"
             f"- TELEGRAM_TARGET_CHAT_ID: {target_chat_id}\n"
