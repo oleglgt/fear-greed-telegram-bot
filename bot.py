@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.7.1"
+BOT_VERSION = "v4.7.2"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1725,14 +1725,27 @@ def call_openai_chat(
     max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
     max_attempts = max(1, min(max_attempts, 5))
     max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "2200"))
+    if provider == "deepseek":
+        # V4 models think by default (effort high): hidden reasoning ate the
+        # 2200-token budget, truncating the JSON mid-string. Our calls are
+        # summarize/score tasks that don't need thinking, so turn it off and
+        # give the visible answer a larger budget.
+        max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4000"))
     payload = {
         "model": model,
         "messages": messages,
     }
+    if provider == "deepseek":
+        payload["temperature"] = temperature
+        payload["max_tokens"] = max_tokens
+        if env_flag("DEEPSEEK_THINKING", False):
+            payload["thinking"] = {"type": "enabled"}
+        else:
+            payload["thinking"] = {"type": "disabled"}
     # Reasoning models (gpt-5*, o1/o3/o4*) reject "max_tokens" and any
     # temperature other than the default, and part of their token budget
     # goes to hidden reasoning before the visible answer.
-    if model.startswith(("gpt-5", "o1", "o3", "o4")):
+    elif model.startswith(("gpt-5", "o1", "o3", "o4")):
         payload["max_completion_tokens"] = max_tokens
         reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
         if reasoning_effort:
@@ -1784,7 +1797,15 @@ def call_openai_chat(
             )
 
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            logger.warning(
+                "%s response truncated by max_tokens (%d) at %s",
+                provider_label,
+                max_tokens,
+                stage_label,
+            )
+        return choice["message"]["content"].strip()
 
     raise ValueError(f"{provider_label} request failed after retries")
 
