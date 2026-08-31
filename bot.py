@@ -10,7 +10,7 @@ import textwrap
 import threading
 import time as time_module
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from functools import partial
@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.6.2"
+BOT_VERSION = "v4.7.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1576,7 +1576,8 @@ def summarize_news_best_effort(
     batch_size = int(os.getenv("NEWS_TRANSLATE_BATCH_SIZE", "5"))
     batch_size = max(1, min(batch_size, 10))
     translated_any = False
-    for start in range(0, len(items), batch_size):
+
+    def summarize_batch(start: int) -> list[dict]:
         batch = items[start : start + batch_size]
         payload_items = [
             {
@@ -1610,18 +1611,31 @@ def summarize_news_best_effort(
                 "content": json.dumps({"items": payload_items}, ensure_ascii=False),
             },
         ]
-        try:
-            text = call_openai_chat(
-                messages,
-                temperature=0.0,
-                stage_label=f"news summary batch {start // batch_size + 1}",
-                provider=provider,
-            )
-            raw = parse_json_payload(text)
-            if not isinstance(raw, dict):
-                continue
-            rows = raw.get("items", [])
-            if not isinstance(rows, list):
+        text = call_openai_chat(
+            messages,
+            temperature=0.0,
+            stage_label=f"news summary batch {start // batch_size + 1}",
+            provider=provider,
+        )
+        raw = parse_json_payload(text)
+        if not isinstance(raw, dict):
+            return []
+        rows = raw.get("items", [])
+        return rows if isinstance(rows, list) else []
+
+    # Batches are independent (each writes its own item indices), so run them
+    # concurrently: with slower models (DeepSeek v4-pro) a sequential loop was
+    # taking minutes; parallel runs collapse it to roughly one batch's latency.
+    starts = list(range(0, len(items), batch_size))
+    workers = max(1, min(int(os.getenv("NEWS_SUMMARY_WORKERS", "3")), 6, len(starts)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(summarize_batch, start): start for start in starts}
+        for future in as_completed(futures):
+            try:
+                rows = future.result()
+            except Exception as exc:
+                if debug_logs is not None:
+                    debug_logs.append(f"Summary batch failed ({exc})")
                 continue
             for row in rows:
                 if not isinstance(row, dict):
@@ -1641,10 +1655,6 @@ def summarize_news_best_effort(
                 if details_ru:
                     items[idx]["details_ru"] = details_ru
                 translated_any = True
-        except Exception as exc:
-            if debug_logs is not None:
-                debug_logs.append(f"Summary batch failed ({exc})")
-            continue
     if debug_logs is not None:
         debug_logs.append("Summary: done" if translated_any else "Summary: skipped")
 
@@ -1703,6 +1713,10 @@ def call_openai_chat(
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         provider_label = "OpenAI"
     timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "40"))
+    if provider == "deepseek":
+        # DeepSeek v4-pro regularly needs over a minute per summary batch;
+        # the OpenAI-sized timeout made every batch die and ship English text.
+        timeout_seconds = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", str(max(timeout_seconds, 150))))
     max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
     max_attempts = max(1, min(max_attempts, 5))
     max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "2200"))
@@ -3159,6 +3173,13 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             news_provider = "deepseek"
     if debug_mode:
         force_refresh = True
+    message = update.effective_message
+    progress_msg = None
+    if message is not None:
+        try:
+            progress_msg = await message.reply_text(f"⏳ Готовлю дайджест ({news_provider})...")
+        except Exception as exc:
+            logger.warning("news progress message failed: %s", exc)
     text, html_mode = await render_block_async(
         block_name="news",
         include_version=True,
@@ -3167,6 +3188,11 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         news_spoilers=True,
         news_provider=news_provider,
     )
+    if progress_msg is not None:
+        try:
+            await progress_msg.delete()
+        except Exception as exc:
+            logger.warning("news progress message delete failed: %s", exc)
     await send_rendered_update(update, text, html_mode)
 
 
