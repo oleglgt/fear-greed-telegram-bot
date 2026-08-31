@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.6.1"
+BOT_VERSION = "v4.6.2"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -3086,7 +3086,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/st - Bitcoin и S&P\n"
             "/fx - валюты\n"
             "/dam - Cyprus reservoirs\n"
-            "/news - новостной дайджест (v1)\n"
+            "/news - новостной дайджест (v1); /news ds - саммари через DeepSeek\n"
             "/hot - самые обсуждаемые новости (по охвату в СМИ)\n"
             "/digest - tech-дайджест с ИИ-скорингом\n"
             "/ideas - Smart Money: покупки фондов (13F) + strong buy аналитиков\n"
@@ -3148,10 +3148,15 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     force_refresh = False
     debug_mode = False
-    if context.args:
-        first = context.args[0].strip().lower()
-        force_refresh = first in {"refresh", "r", "now", "new"}
-        debug_mode = first in {"debug", "dbg", "trace"}
+    news_provider = "openai"
+    for arg in context.args or []:
+        token = arg.strip().lower()
+        if token in {"refresh", "r", "now", "new"}:
+            force_refresh = True
+        elif token in {"debug", "dbg", "trace"}:
+            debug_mode = True
+        elif token in {"ds", "deepseek"}:
+            news_provider = "deepseek"
     if debug_mode:
         force_refresh = True
     text, html_mode = await render_block_async(
@@ -3160,6 +3165,7 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         force_refresh=force_refresh,
         debug_mode=debug_mode,
         news_spoilers=True,
+        news_provider=news_provider,
     )
     await send_rendered_update(update, text, html_mode)
 
