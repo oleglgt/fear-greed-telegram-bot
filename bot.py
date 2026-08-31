@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.7.0"
+BOT_VERSION = "v4.7.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1634,6 +1634,9 @@ def summarize_news_best_effort(
             try:
                 rows = future.result()
             except Exception as exc:
+                # Always log: silent per-batch failures are exactly how the
+                # digest ships in English with no trace in Render logs.
+                logger.warning("news summary batch (provider=%s) failed: %s", provider, exc)
                 if debug_logs is not None:
                     debug_logs.append(f"Summary batch failed ({exc})")
                 continue
@@ -1655,6 +1658,8 @@ def summarize_news_best_effort(
                 if details_ru:
                     items[idx]["details_ru"] = details_ru
                 translated_any = True
+    if not translated_any:
+        logger.warning("news summary (provider=%s): no batch produced translations", provider)
     if debug_logs is not None:
         debug_logs.append("Summary: done" if translated_any else "Summary: skipped")
 
