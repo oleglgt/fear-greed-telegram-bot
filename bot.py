@@ -69,10 +69,11 @@ DAM_DEBUG_PROBE_URLS: list[str] = [
     "https://fragmata.info/",
 ]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.5.0"
+BOT_VERSION = "v4.6.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -399,6 +400,7 @@ def render_block(
     force_refresh: bool = False,
     debug_mode: bool = False,
     news_spoilers: bool = True,
+    news_provider: str = "openai",
 ) -> tuple[str, bool]:
     html_mode = False
     if block_name == "fg":
@@ -415,6 +417,7 @@ def render_block(
             force_refresh=force_refresh,
             debug_mode=debug_mode,
             use_spoilers=html_mode,
+            summary_provider=news_provider,
         )
     elif block_name == "hot":
         html_mode = news_spoilers and not debug_mode
@@ -1546,13 +1549,27 @@ def attach_article_texts(items: list[dict[str, str]]) -> int:
 
 
 def summarize_news_best_effort(
-    items: list[dict[str, str]], debug_logs: list[str] | None = None
+    items: list[dict[str, str]],
+    debug_logs: list[str] | None = None,
+    provider: str = "openai",
 ) -> None:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or not items:
+    # Experiment: evening digest goes through DeepSeek; if its key is missing,
+    # fall back to OpenAI instead of shipping an untranslated digest.
+    if provider == "deepseek" and not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        logger.warning("news summary: DEEPSEEK_API_KEY is not set, falling back to openai")
         if debug_logs is not None:
-            debug_logs.append("Summary: skipped (no OPENAI_API_KEY or empty list)")
+            debug_logs.append("Summary: DEEPSEEK_API_KEY missing, fallback to openai")
+        provider = "openai"
+    if provider == "openai" and not os.getenv("OPENAI_API_KEY", "").strip():
+        if debug_logs is not None:
+            debug_logs.append("Summary: skipped (no OPENAI_API_KEY)")
         return
+    if not items:
+        if debug_logs is not None:
+            debug_logs.append("Summary: skipped (empty list)")
+        return
+    if debug_logs is not None:
+        debug_logs.append(f"Summary provider: {provider}")
     fetched = attach_article_texts(items)
     if debug_logs is not None:
         debug_logs.append(f"Article fetch: {fetched}/{len(items)} bodies")
@@ -1598,6 +1615,7 @@ def summarize_news_best_effort(
                 messages,
                 temperature=0.0,
                 stage_label=f"news summary batch {start // batch_size + 1}",
+                provider=provider,
             )
             raw = parse_json_payload(text)
             if not isinstance(raw, dict):
@@ -1668,14 +1686,25 @@ def call_openai_chat(
     messages: list[dict[str, str]],
     temperature: float = 0.2,
     stage_label: str = "request",
+    provider: str = "openai",
 ) -> str:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not set")
+    if provider == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("DEEPSEEK_API_KEY is not set")
+        api_url = DEEPSEEK_CHAT_COMPLETIONS_URL
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        provider_label = "DeepSeek"
+    else:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not set")
+        api_url = OPENAI_CHAT_COMPLETIONS_URL
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        provider_label = "OpenAI"
     timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "40"))
     max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
     max_attempts = max(1, min(max_attempts, 5))
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "2200"))
     payload = {
         "model": model,
@@ -1696,7 +1725,7 @@ def call_openai_chat(
     for attempt in range(max_attempts):
         try:
             response = requests.post(
-                OPENAI_CHAT_COMPLETIONS_URL,
+                api_url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -1709,14 +1738,14 @@ def call_openai_chat(
                 time_module.sleep(1.5 * (attempt + 1))
                 continue
             raise ValueError(
-                f"OpenAI timeout at {stage_label} after {max_attempts} attempts "
+                f"{provider_label} timeout at {stage_label} after {max_attempts} attempts "
                 f"({timeout_seconds}s each): {exc}"
             ) from exc
         except requests.exceptions.RequestException as exc:
             if attempt < (max_attempts - 1):
                 time_module.sleep(1.5 * (attempt + 1))
                 continue
-            raise ValueError(f"OpenAI request error at {stage_label}: {exc}") from exc
+            raise ValueError(f"{provider_label} request error at {stage_label}: {exc}") from exc
 
         if response.status_code == 429:
             retry_after_raw = response.headers.get("Retry-After", "").strip()
@@ -1728,20 +1757,22 @@ def call_openai_chat(
                 wait_seconds = max(retry_after, 2.0 * (attempt + 1))
                 time_module.sleep(wait_seconds)
                 continue
-            raise ValueError(f"OpenAI 429 at {stage_label}: {response.text[:220]}")
+            raise ValueError(f"{provider_label} 429 at {stage_label}: {response.text[:220]}")
 
         if not response.ok:
             raise ValueError(
-                f"OpenAI {response.status_code} at {stage_label}: {response.text[:220]}"
+                f"{provider_label} {response.status_code} at {stage_label}: {response.text[:220]}"
             )
 
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
 
-    raise ValueError("OpenAI request failed after retries")
+    raise ValueError(f"{provider_label} request failed after retries")
 
 
-def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, str]], list[str]]:
+def fetch_news_items_via_ai(
+    debug_mode: bool = False, summary_provider: str = "openai"
+) -> tuple[list[dict[str, str]], list[str]]:
     now_utc_dt = datetime.now(timezone.utc)
     now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_ts = now_utc_dt.timestamp()
@@ -1812,7 +1843,9 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
     for category, count in NEWS_TARGETS:
         final_items.extend(by_category[category][:count])
 
-    summarize_news_best_effort(final_items, debug_logs if debug_mode else None)
+    summarize_news_best_effort(
+        final_items, debug_logs if debug_mode else None, provider=summary_provider
+    )
 
     if debug_mode:
         counts = ", ".join(f"{cat}={len(by_category[cat])}" for cat, _ in NEWS_TARGETS)
@@ -1831,12 +1864,18 @@ def fetch_news_items_via_ai(debug_mode: bool = False) -> tuple[list[dict[str, st
 
 
 def build_news_block(
-    force_refresh: bool = False, debug_mode: bool = False, use_spoilers: bool = False
+    force_refresh: bool = False,
+    debug_mode: bool = False,
+    use_spoilers: bool = False,
+    summary_provider: str = "openai",
 ) -> str:
     ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
     fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
     now_ts = datetime.now(timezone.utc).timestamp()
-    cache_key = "html" if (use_spoilers and not debug_mode) else "plain"
+    mode_key = "html" if (use_spoilers and not debug_mode) else "plain"
+    # Provider is part of the key so the 20:00 DeepSeek run never reuses a
+    # digest summarized by OpenAI minutes earlier (and vice versa).
+    cache_key = f"{mode_key}:{summary_provider}"
     cached_entry = NEWS_CACHE.get(cache_key)
     if (
         not force_refresh
@@ -1850,7 +1889,9 @@ def build_news_block(
         return cached
 
     try:
-        ai_items, debug_logs = fetch_news_items_via_ai(debug_mode=debug_mode)
+        ai_items, debug_logs = fetch_news_items_via_ai(
+            debug_mode=debug_mode, summary_provider=summary_provider
+        )
         if debug_mode:
             lines = ["News service (debug):"]
             for log in debug_logs:
@@ -1883,7 +1924,10 @@ def build_news_block(
             lines.append("")
 
         lines.append("")
-        lines.append(f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}")
+        lines.append(
+            f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
+            f" | AI: {summary_provider}"
+        )
         content = "\n".join(lines)
         NEWS_CACHE[cache_key] = {
             "content": content,
@@ -3213,12 +3257,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
+    # Experiment: the 08:00 digest is summarized by OpenAI as before, the
+    # 20:00 one by DeepSeek (falls back to OpenAI if the key is missing).
+    job_name = context.job.name or ""
+    news_provider = "deepseek" if "2000" in job_name else "openai"
     block_order = ["fg", "st", "fx", "dam", "news", "ideas"]
     for idx, block_name in enumerate(block_order):
         text, html_mode = await render_block_async(
             block_name=block_name,
             include_version=(idx == 0),
             news_spoilers=True,
+            news_provider=news_provider,
         )
         await send_rendered_chat(context, chat_id, text, html_mode)
 
@@ -3392,7 +3441,7 @@ async def on_startup(app) -> None:
         data=target_chat_id,
         name="daily_report_2000_cyprus",
     )
-    SCHEDULER_STATUS = "enabled: 08:00 and 20:00 Europe/Nicosia"
+    SCHEDULER_STATUS = "enabled: 08:00 (news: openai) and 20:00 (news: deepseek) Europe/Nicosia"
 
     if env_flag("SEND_DEPLOY_NOTIFICATION", True):
         try:
