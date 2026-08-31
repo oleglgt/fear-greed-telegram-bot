@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.6.0"
+BOT_VERSION = "v4.6.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1693,7 +1693,7 @@ def call_openai_chat(
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY is not set")
         api_url = DEEPSEEK_CHAT_COMPLETIONS_URL
-        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         provider_label = "DeepSeek"
     else:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
