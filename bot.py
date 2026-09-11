@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.7.2"
+BOT_VERSION = "v4.8.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1715,16 +1715,25 @@ def call_openai_chat(
         if not api_key:
             raise ValueError("OPENAI_API_KEY is not set")
         api_url = OPENAI_CHAT_COMPLETIONS_URL
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        model = os.getenv("OPENAI_MODEL", "gpt-6-astra")
         provider_label = "OpenAI"
+    is_openai_reasoning = provider != "deepseek" and model.startswith(
+        ("gpt-6", "gpt-5", "o1", "o3", "o4")
+    )
     timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "40"))
+    if is_openai_reasoning:
+        # gpt-6-astra thinks before answering; a summary batch can take well
+        # over the 40s that was tuned for gpt-4o-mini.
+        timeout_seconds = max(timeout_seconds, 120)
     if provider == "deepseek":
         # DeepSeek v4-pro regularly needs over a minute per summary batch;
         # the OpenAI-sized timeout made every batch die and ship English text.
         timeout_seconds = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", str(max(timeout_seconds, 150))))
     max_attempts = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
     max_attempts = max(1, min(max_attempts, 5))
-    max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "2200"))
+    # Reasoning models spend part of the budget on hidden thinking, so give
+    # them more room than the 2200 tokens that fit gpt-4o-mini's visible JSON.
+    max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "6000" if is_openai_reasoning else "2200"))
     if provider == "deepseek":
         # V4 models think by default (effort high): hidden reasoning ate the
         # 2200-token budget, truncating the JSON mid-string. Our calls are
@@ -1742,10 +1751,10 @@ def call_openai_chat(
             payload["thinking"] = {"type": "enabled"}
         else:
             payload["thinking"] = {"type": "disabled"}
-    # Reasoning models (gpt-5*, o1/o3/o4*) reject "max_tokens" and any
+    # Reasoning models (gpt-6*, gpt-5*, o1/o3/o4*) reject "max_tokens" and any
     # temperature other than the default, and part of their token budget
     # goes to hidden reasoning before the visible answer.
-    elif model.startswith(("gpt-5", "o1", "o3", "o4")):
+    elif is_openai_reasoning:
         payload["max_completion_tokens"] = max_tokens
         reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
         if reasoning_effort:
@@ -3288,7 +3297,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-6-astra")
     deploy_notify = "yes" if env_flag("SEND_DEPLOY_NOTIFICATION", True) else "no"
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
