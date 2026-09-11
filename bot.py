@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.8.0"
+BOT_VERSION = "v4.8.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1715,14 +1715,14 @@ def call_openai_chat(
         if not api_key:
             raise ValueError("OPENAI_API_KEY is not set")
         api_url = OPENAI_CHAT_COMPLETIONS_URL
-        model = os.getenv("OPENAI_MODEL", "gpt-6-astra")
+        model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
         provider_label = "OpenAI"
     is_openai_reasoning = provider != "deepseek" and model.startswith(
         ("gpt-6", "gpt-5", "o1", "o3", "o4")
     )
     timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "40"))
     if is_openai_reasoning:
-        # gpt-6-astra thinks before answering; a summary batch can take well
+        # gpt-5.6/gpt-6 think before answering; a summary batch can take well
         # over the 40s that was tuned for gpt-4o-mini.
         timeout_seconds = max(timeout_seconds, 120)
     if provider == "deepseek":
@@ -3297,7 +3297,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-6-astra")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
     deploy_notify = "yes" if env_flag("SEND_DEPLOY_NOTIFICATION", True) else "no"
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
