@@ -73,7 +73,7 @@ DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.8.1"
+BOT_VERSION = "v4.8.2"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -2175,18 +2175,35 @@ def build_hot_news_block(force_refresh: bool = False, use_spoilers: bool = False
 # ── /ideas: Smart Money (13F + analysts) ────────────────────────────────────
 
 
+_EDGAR_UA_WARNED = False
+
+
 def _edgar_headers() -> dict[str, str]:
-    # SEC asks automated clients to identify themselves via User-Agent.
-    ua = os.getenv(
-        "EDGAR_USER_AGENT",
-        "fear-greed-telegram-bot/1.0 (+https://github.com/oleglgt/fear-greed-telegram-bot)",
-    )
-    return {"User-Agent": ua, "Accept": "application/json,text/xml,*/*"}
+    # SEC's fair-access policy: User-Agent must name the app and a contact
+    # e-mail ("App Name admin@example.com"). A URL instead of an e-mail is
+    # rejected with 403 "Undeclared Automated Tool", which is what the old
+    # default (GitHub link) started getting in late Sept 2026.
+    global _EDGAR_UA_WARNED
+    ua = os.getenv("EDGAR_USER_AGENT", "").strip() or "fear-greed-telegram-bot/1.0 contact@example.com"
+    if "@" not in ua and not _EDGAR_UA_WARNED:
+        _EDGAR_UA_WARNED = True
+        logger.warning("EDGAR_USER_AGENT has no contact e-mail; SEC may answer 403: %r", ua)
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json,text/xml,*/*",
+        "Accept-Encoding": "gzip, deflate",
+    }
 
 
 def _edgar_get(url: str) -> requests.Response:
     time_module.sleep(0.15)  # stay far below SEC's 10 req/s limit
     response = requests.get(url, headers=_edgar_headers(), timeout=HTTP_TIMEOUT_LONG)
+    if response.status_code == 403:
+        # SEC's 403 page says *why* (undeclared tool vs. edge/IP block);
+        # surface a snippet so /ideas and the logs show the real cause.
+        snippet = re.sub(r"<[^>]+>", " ", response.text or "")
+        snippet = re.sub(r"\s+", " ", snippet).strip()[:160]
+        raise ValueError(f"SEC 403 for {url}: {snippet or 'empty body'}")
     response.raise_for_status()
     return response
 
