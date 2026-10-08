@@ -76,7 +76,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.0.2"
+BOT_VERSION = "v5.1.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -153,11 +153,34 @@ AGENTPAY_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 AGENTPAY_WINDOW_HOURS = 48  # niche topic: a 24h window often yields too few items
+# Categories whose candidates are scored for relevance by the AI before the
+# digest is assembled. We oversample the feeds, ask the model for a 0-10
+# relevance score per item, keep those >= min_score, and remember rejects in
+# the history file so they are not re-scored on the next run.
+NEWS_AI_FILTERS: dict[str, dict[str, object]] = {
+    "finance": {
+        "oversample": 3,
+        "min_score": 6,
+        "criteria": (
+            "Relevant (7-10): financial markets (stocks, bonds, FX, commodities, "
+            "crypto), central banks and monetary policy, macroeconomics (GDP, "
+            "inflation, jobs, trade), public companies (earnings, M&A, guidance, "
+            "major corporate moves), banking and fintech, EU/Cyprus economy. "
+            "Irrelevant (0-3): lifestyle, dating, careers advice, personal "
+            "finance tips, housing/consumer human-interest stories, celebrity, "
+            "sports business, local UK consumer affairs, opinion columns "
+            "without market impact."
+        ),
+    },
+}
 MAX_TELEGRAM_MESSAGE_LEN = 3900
 HTTP_TIMEOUT_SHORT = 15  # market/FX APIs
 HTTP_TIMEOUT_LONG = 30  # RSS feeds, XLSX downloads
 # Finance = markets/economy/company news; deliberately no MarketWatch-style
 # personal-finance feeds (tax tips, retirement advice for US consumers).
+# BBC Business was dropped: a general-audience feed full of lifestyle and
+# consumer stories. Finance candidates also pass the AI relevance filter
+# (NEWS_AI_FILTERS) before they reach the digest.
 NEWS_RSS_FEEDS: dict[str, list[str]] = {
     "ai": [
         "https://techcrunch.com/category/artificial-intelligence/feed/",
@@ -166,8 +189,10 @@ NEWS_RSS_FEEDS: dict[str, list[str]] = {
         "https://news.mit.edu/rss/topic/artificial-intelligence2",
     ],
     "finance": [
-        "https://feeds.bbci.co.uk/news/business/rss.xml",
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
+        "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",  # WSJ Markets
+        "https://www.cnbc.com/id/10000664/device/rss/rss.html",  # CNBC Finance
+        "https://www.cnbc.com/id/10001147/device/rss/rss.html",  # CNBC Economy
         "https://www.theguardian.com/uk/business/rss",
     ],
     "robotics": [
@@ -1941,6 +1966,87 @@ def call_openai_chat(
     raise ValueError(f"{provider_label} request failed after retries")
 
 
+def filter_items_by_relevance(
+    category: str,
+    items: list[dict[str, str]],
+    count: int,
+    provider: str | None,
+    debug_logs: list[str] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Score candidates with the AI and keep the `count` most relevant.
+
+    Returns (kept, rejected). On any AI failure falls back to the `count`
+    freshest items (the pre-filter behaviour) and rejects nothing.
+    """
+    cfg = NEWS_AI_FILTERS.get(category)
+    if not cfg or len(items) <= 0:
+        return items[:count], []
+    min_score = int(cfg.get("min_score", 6))
+    payload = [
+        {
+            "id": idx,
+            "headline": item.get("headline_en", ""),
+            "summary": str(item.get("details_en", ""))[:300],
+            "source": item.get("source", ""),
+        }
+        for idx, item in enumerate(items)
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You curate the '{category}' section of a daily news digest for an "
+                "investor. Score each item 0-10 for relevance. "
+                f"{cfg['criteria']} "
+                'Return strict JSON only: {"items":[{"id":0,"score":7}]}. '
+                "Score every id exactly once. No markdown."
+            ),
+        },
+        {"role": "user", "content": json.dumps({"items": payload}, ensure_ascii=False)},
+    ]
+    try:
+        text = call_openai_chat(
+            messages, temperature=0.0, stage_label=f"{category} relevance filter", provider=provider
+        )
+        raw = parse_json_payload(text)
+        rows = raw.get("items", []) if isinstance(raw, dict) else []
+        scores: dict[int, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                scores[int(row["id"])] = float(row["score"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not scores:
+            raise ValueError("no scores in response")
+    except Exception as exc:
+        logger.warning("news %s relevance filter failed, keeping freshest: %s", category, exc)
+        if debug_logs is not None:
+            debug_logs.append(f"Filter {category}: failed ({exc}), kept freshest {count}")
+        return items[:count], []
+
+    # Unscored items count as neutral (min_score) so a partial answer does not
+    # silently drop them; ties keep feed order (freshest first).
+    ranked = sorted(
+        enumerate(items), key=lambda pair: (-scores.get(pair[0], float(min_score)), pair[0])
+    )
+    kept = [item for idx, item in ranked if scores.get(idx, min_score) >= min_score][:count]
+    kept_ids = {id(item) for item in kept}
+    rejected = [item for item in items if id(item) not in kept_ids]
+    if debug_logs is not None:
+        debug_logs.append(
+            f"Filter {category}: scored {len(scores)}/{len(items)}, kept {len(kept)}, "
+            f"rejected {len(rejected)} (min {min_score})"
+        )
+        for idx, item in enumerate(items):
+            mark = "+" if id(item) in kept_ids else "-"
+            debug_logs.append(
+                f"  {mark} {scores.get(idx, '?')}: {str(item.get('headline_en', ''))[:80]}"
+            )
+    return kept, rejected
+
+
 def fetch_news_items_via_ai(
     debug_mode: bool = False, summary_provider: str | None = None
 ) -> tuple[list[dict[str, str]], list[str], str | None]:
@@ -1958,16 +2064,26 @@ def fetch_news_items_via_ai(
     # Niche agentpay goes first: its stories also appear in the broad AI feeds,
     # and whichever category collects an item first wins via the dedup set.
     fetch_order = sorted(NEWS_TARGETS, key=lambda t: t[0] != "agentpay")
+    rejected_items: list[dict[str, str]] = []
     for category, count in fetch_order:
         window_hours = AGENTPAY_WINDOW_HOURS if category == "agentpay" else 24
         cutoff = now_ts - window_hours * 3600
+        filter_cfg = NEWS_AI_FILTERS.get(category)
+        # Filtered categories collect up to `count` per feed and `oversample`x
+        # overall, so the AI has a real choice instead of the freshest N.
+        collect_target = count * int(filter_cfg.get("oversample", 3)) if filter_cfg else count
+        per_feed_cap = count if filter_cfg else collect_target
         if debug_mode:
-            debug_logs.append(f"RSS: category {category} target {count} window {window_hours}h")
+            debug_logs.append(
+                f"RSS: category {category} target {count} window {window_hours}h"
+                + (f" (AI filter, collecting up to {collect_target})" if filter_cfg else "")
+            )
         feeds = NEWS_RSS_FEEDS.get(category, [])
         collected: list[dict[str, str]] = []
         for feed_url in feeds:
-            if len(collected) >= count:
+            if len(collected) >= collect_target:
                 break
+            taken_from_feed = 0
             try:
                 xml_text = get_url_text(feed_url)
                 feed_items = parse_news_feed_items(xml_text, category, feed_url)
@@ -1995,20 +2111,28 @@ def fetch_news_items_via_ai(
                     fresh_items.append(item)
                 fresh_items.sort(key=lambda x: float(x.get("_ts", "0")), reverse=True)
                 for item in fresh_items:
-                    if len(collected) >= count:
+                    if len(collected) >= collect_target or taken_from_feed >= per_feed_cap:
                         break
                     item.pop("_ts", None)
                     collected.append(item)
+                    taken_from_feed += 1
                 if debug_mode:
                     debug_logs.append(
                         f"RSS: {category} from {feed_url} +{len(fresh_items)} "
-                        f"(have={len(collected)}/{count})"
+                        f"(have={len(collected)}/{collect_target})"
                     )
             except Exception as exc:
                 if debug_mode:
                     debug_logs.append(f"RSS: {category} source failed {feed_url} ({exc})")
                 continue
-        by_category[category] = collected[:count]
+        if filter_cfg and collected:
+            kept, rejected = filter_items_by_relevance(
+                category, collected, count, summary_provider, debug_logs if debug_mode else None
+            )
+            rejected_items.extend(rejected)
+            by_category[category] = kept
+        else:
+            by_category[category] = collected[:count]
 
     final_items: list[dict[str, str]] = []
     for category, count in NEWS_TARGETS:
@@ -2027,7 +2151,7 @@ def fetch_news_items_via_ai(
 
     with STATE_LOCK:
         history = prune_news_history(load_news_history(), now_ts)
-        for item in final_items:
+        for item in final_items + rejected_items:
             history[news_item_fingerprint(item)] = now_ts
         save_news_history(history)
 
