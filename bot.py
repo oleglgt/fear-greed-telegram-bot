@@ -76,7 +76,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.0.1"
+BOT_VERSION = "v5.0.2"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1555,7 +1555,10 @@ def summarize_news_best_effort(
     items: list[dict[str, str]],
     debug_logs: list[str] | None = None,
     provider: str | None = None,
-) -> None:
+) -> str | None:
+    """Translate/summarize items in place. Returns the provider that actually
+    produced translations, or None when every provider failed (the digest
+    then ships in English)."""
     # A provider picked explicitly (/news ds, /news cl) whose key is missing
     # falls back to OpenAI instead of shipping an untranslated digest.
     provider = resolve_ai_provider(provider)
@@ -1568,11 +1571,11 @@ def summarize_news_best_effort(
     if provider == "openai" and not os.getenv("OPENAI_API_KEY", "").strip():
         if debug_logs is not None:
             debug_logs.append("Summary: skipped (no OPENAI_API_KEY)")
-        return
+        return None
     if not items:
         if debug_logs is not None:
             debug_logs.append("Summary: skipped (empty list)")
-        return
+        return None
     if debug_logs is not None:
         debug_logs.append(f"Summary provider: {provider}")
     fetched = attach_article_texts(items)
@@ -1671,10 +1674,10 @@ def summarize_news_best_effort(
             logger.warning("news summary: retrying all batches via openai")
             if debug_logs is not None:
                 debug_logs.append(f"Summary: {provider} produced nothing, retrying via openai")
-            summarize_news_best_effort(items, debug_logs, provider="openai")
-            return
+            return summarize_news_best_effort(items, debug_logs, provider="openai")
     if debug_logs is not None:
-        debug_logs.append("Summary: done" if translated_any else "Summary: skipped")
+        debug_logs.append(f"Summary: done via {provider}" if translated_any else "Summary: failed")
+    return provider if translated_any else None
 
 
 def format_expanded_details(item: dict[str, str]) -> str:
@@ -1940,7 +1943,7 @@ def call_openai_chat(
 
 def fetch_news_items_via_ai(
     debug_mode: bool = False, summary_provider: str | None = None
-) -> tuple[list[dict[str, str]], list[str]]:
+) -> tuple[list[dict[str, str]], list[str], str | None]:
     now_utc_dt = datetime.now(timezone.utc)
     now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_ts = now_utc_dt.timestamp()
@@ -2011,7 +2014,7 @@ def fetch_news_items_via_ai(
     for category, count in NEWS_TARGETS:
         final_items.extend(by_category[category][:count])
 
-    summarize_news_best_effort(
+    used_provider = summarize_news_best_effort(
         final_items, debug_logs if debug_mode else None, provider=summary_provider
     )
 
@@ -2028,7 +2031,7 @@ def fetch_news_items_via_ai(
             history[news_item_fingerprint(item)] = now_ts
         save_news_history(history)
 
-    return final_items, debug_logs
+    return final_items, debug_logs, used_provider
 
 
 def build_news_block(
@@ -2058,9 +2061,16 @@ def build_news_block(
         return cached
 
     try:
-        ai_items, debug_logs = fetch_news_items_via_ai(
+        ai_items, debug_logs, used_provider = fetch_news_items_via_ai(
             debug_mode=debug_mode, summary_provider=summary_provider
         )
+        # Footer shows who actually translated, not who was asked.
+        if used_provider is None:
+            ai_label = f"none ({summary_provider} failed, untranslated)"
+        elif used_provider != summary_provider:
+            ai_label = f"{used_provider} (fallback, {summary_provider} failed)"
+        else:
+            ai_label = used_provider
         if debug_mode:
             lines = ["News service (debug):"]
             for log in debug_logs:
@@ -2095,7 +2105,7 @@ def build_news_block(
         lines.append("")
         lines.append(
             f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
-            f" | AI: {summary_provider}"
+            f" | AI: {ai_label}"
         )
         content = "\n".join(lines)
         NEWS_CACHE[cache_key] = {
