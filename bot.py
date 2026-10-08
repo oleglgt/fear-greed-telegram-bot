@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
+import anthropic
 import requests
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -70,10 +71,12 @@ DAM_DEBUG_PROBE_URLS: list[str] = [
 ]
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
+ANTHROPIC_DEFAULT_MODEL = "claude-opus-5-5"
+AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v4.8.2"
+BOT_VERSION = "v5.0.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -400,7 +403,7 @@ def render_block(
     force_refresh: bool = False,
     debug_mode: bool = False,
     news_spoilers: bool = True,
-    news_provider: str = "openai",
+    news_provider: str | None = None,
 ) -> tuple[str, bool]:
     html_mode = False
     if block_name == "fg":
@@ -1551,14 +1554,16 @@ def attach_article_texts(items: list[dict[str, str]]) -> int:
 def summarize_news_best_effort(
     items: list[dict[str, str]],
     debug_logs: list[str] | None = None,
-    provider: str = "openai",
+    provider: str | None = None,
 ) -> None:
-    # Experiment: evening digest goes through DeepSeek; if its key is missing,
-    # fall back to OpenAI instead of shipping an untranslated digest.
-    if provider == "deepseek" and not os.getenv("DEEPSEEK_API_KEY", "").strip():
-        logger.warning("news summary: DEEPSEEK_API_KEY is not set, falling back to openai")
+    # A provider picked explicitly (/news ds, /news cl) whose key is missing
+    # falls back to OpenAI instead of shipping an untranslated digest.
+    provider = resolve_ai_provider(provider)
+    key_var = {"claude": "ANTHROPIC_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}.get(provider)
+    if key_var and not os.getenv(key_var, "").strip():
+        logger.warning("news summary: %s is not set, falling back to openai", key_var)
         if debug_logs is not None:
-            debug_logs.append("Summary: DEEPSEEK_API_KEY missing, fallback to openai")
+            debug_logs.append(f"Summary: {key_var} missing, fallback to openai")
         provider = "openai"
     if provider == "openai" and not os.getenv("OPENAI_API_KEY", "").strip():
         if debug_logs is not None:
@@ -1696,13 +1701,109 @@ def format_expanded_details(item: dict[str, str]) -> str:
             )
     return "\n".join(lines[:10]) if lines else "Подробности недоступны."
 
+_AI_PROVIDER_WARNED = False
+
+
+def default_ai_provider() -> str:
+    """Provider for every news/digest AI call unless a command picks one.
+
+    NEWS_AI_PROVIDER (claude | openai | deepseek), default claude. Falls back
+    to OpenAI when the chosen provider's key is missing so digests keep going.
+    """
+    global _AI_PROVIDER_WARNED
+    wanted = os.getenv("NEWS_AI_PROVIDER", "claude").strip().lower() or "claude"
+    if wanted not in AI_PROVIDERS:
+        wanted = "claude"
+    key_var = {"claude": "ANTHROPIC_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}[wanted]
+    if wanted != "openai" and not os.getenv(key_var, "").strip() and os.getenv("OPENAI_API_KEY", "").strip():
+        if not _AI_PROVIDER_WARNED:
+            _AI_PROVIDER_WARNED = True
+            logger.warning("NEWS_AI_PROVIDER=%s but %s is not set; using OpenAI", wanted, key_var)
+        return "openai"
+    return wanted
+
+
+def resolve_ai_provider(provider: str | None) -> str:
+    return provider if provider in AI_PROVIDERS else default_ai_provider()
+
+
+def _split_chat_messages(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+    """OpenAI-style [{role, content}] -> (system text, Claude messages)."""
+    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+    chat = [
+        {"role": "assistant" if m.get("role") == "assistant" else "user", "content": m["content"]}
+        for m in messages
+        if m.get("role") != "system"
+    ]
+    if not chat:
+        chat = [{"role": "user", "content": "Proceed."}]
+    return "\n\n".join(system_parts), chat
+
+
+def call_claude_chat(messages: list[dict[str, str]], stage_label: str = "request") -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is not set")
+    model = os.getenv("ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL).strip() or ANTHROPIC_DEFAULT_MODEL
+    # Summaries/translations are routine work: low effort keeps the hidden
+    # thinking (billed as output) small. Raise via ANTHROPIC_EFFORT if needed.
+    effort = os.getenv("ANTHROPIC_EFFORT", "low").strip() or "low"
+    max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", "16000"))
+    timeout_seconds = float(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "150"))
+    system_text, chat = _split_chat_messages(messages)
+
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds, max_retries=3)
+    request: dict[str, object] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": chat,
+        "output_config": {"effort": effort},
+    }
+    if system_text:
+        request["system"] = system_text
+    # Server-side refusal fallback: if a safety classifier declines a batch
+    # (news text can trip them), the API re-runs it on a fallback model inside
+    # the same call. Not supported on Haiku. ANTHROPIC_FALLBACK=0 disables.
+    use_fallback = env_flag("ANTHROPIC_FALLBACK", True) and "haiku" not in model
+    try:
+        if use_fallback:
+            response = client.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request
+            )
+        else:
+            response = client.messages.create(**request)
+    except anthropic.RateLimitError as exc:
+        raise ValueError(f"Claude 429 at {stage_label}: {exc.message}") from exc
+    except anthropic.APIStatusError as exc:
+        raise ValueError(f"Claude {exc.status_code} at {stage_label}: {exc.message[:220]}") from exc
+    except anthropic.APITimeoutError as exc:
+        raise ValueError(f"Claude timeout at {stage_label} ({timeout_seconds:.0f}s): {exc}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise ValueError(f"Claude connection error at {stage_label}: {exc}") from exc
+
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        category = getattr(details, "category", None) if details else None
+        raise ValueError(f"Claude refused at {stage_label} (category={category})")
+    if response.stop_reason == "max_tokens":
+        logger.warning("Claude response truncated by max_tokens (%d) at %s", max_tokens, stage_label)
+    if getattr(response, "model", None) and response.model != model:
+        logger.info("Claude fallback served %s by %s", stage_label, response.model)
+    text = "".join(block.text for block in response.content if block.type == "text").strip()
+    if not text:
+        raise ValueError(f"Claude returned no text at {stage_label} (stop_reason={response.stop_reason})")
+    return text
+
 
 def call_openai_chat(
     messages: list[dict[str, str]],
     temperature: float = 0.2,
     stage_label: str = "request",
-    provider: str = "openai",
+    provider: str | None = None,
 ) -> str:
+    provider = resolve_ai_provider(provider)
+    if provider == "claude":
+        return call_claude_chat(messages, stage_label=stage_label)
     if provider == "deepseek":
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
@@ -1820,7 +1921,7 @@ def call_openai_chat(
 
 
 def fetch_news_items_via_ai(
-    debug_mode: bool = False, summary_provider: str = "openai"
+    debug_mode: bool = False, summary_provider: str | None = None
 ) -> tuple[list[dict[str, str]], list[str]]:
     now_utc_dt = datetime.now(timezone.utc)
     now_utc = now_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1916,7 +2017,7 @@ def build_news_block(
     force_refresh: bool = False,
     debug_mode: bool = False,
     use_spoilers: bool = False,
-    summary_provider: str = "openai",
+    summary_provider: str | None = None,
 ) -> str:
     ttl = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
     fallback_ttl = int(os.getenv("NEWS_FALLBACK_CACHE_TTL_SECONDS", "120"))
@@ -1924,6 +2025,7 @@ def build_news_block(
     mode_key = "html" if (use_spoilers and not debug_mode) else "plain"
     # Provider is part of the key so the 20:00 DeepSeek run never reuses a
     # digest summarized by OpenAI minutes earlier (and vice versa).
+    summary_provider = resolve_ai_provider(summary_provider)
     cache_key = f"{mode_key}:{summary_provider}"
     cached_entry = NEWS_CACHE.get(cache_key)
     if (
@@ -3214,7 +3316,7 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     force_refresh = False
     debug_mode = False
-    news_provider = "openai"
+    news_provider: str | None = None
     for arg in context.args or []:
         token = arg.strip().lower()
         if token in {"refresh", "r", "now", "new"}:
@@ -3223,6 +3325,11 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             debug_mode = True
         elif token in {"ds", "deepseek"}:
             news_provider = "deepseek"
+        elif token in {"oa", "openai", "gpt"}:
+            news_provider = "openai"
+        elif token in {"cl", "claude"}:
+            news_provider = "claude"
+    news_provider = resolve_ai_provider(news_provider)
     if debug_mode:
         force_refresh = True
     message = update.effective_message
@@ -3315,6 +3422,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_chat_id = os.getenv("TELEGRAM_TARGET_CHAT_ID", "(not set)")
     openai_key_set = "yes" if os.getenv("OPENAI_API_KEY", "").strip() else "no"
     openai_model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
+    anthropic_key_set = "yes" if os.getenv("ANTHROPIC_API_KEY", "").strip() else "no"
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL)
+    ai_provider = default_ai_provider()
     deploy_notify = "yes" if env_flag("SEND_DEPLOY_NOTIFICATION", True) else "no"
     has_job_queue = "yes" if context.application.job_queue is not None else "no"
     jobs = context.application.job_queue.jobs() if context.application.job_queue else []
@@ -3331,6 +3441,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"- Scheduler: {SCHEDULER_STATUS}\n"
             f"- job_queue available: {has_job_queue}\n"
             f"- TELEGRAM_TARGET_CHAT_ID: {target_chat_id}\n"
+            f"- AI provider (news/digest): {ai_provider}\n"
+            f"- ANTHROPIC_API_KEY set: {anthropic_key_set}\n"
+            f"- ANTHROPIC_MODEL: {anthropic_model}\n"
             f"- OPENAI_API_KEY set: {openai_key_set}\n"
             f"- OPENAI_MODEL: {openai_model}\n"
             f"- SEND_DEPLOY_NOTIFICATION: {deploy_notify}\n"
@@ -3341,10 +3454,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    # Experiment: the 08:00 digest is summarized by OpenAI as before, the
-    # 20:00 one by DeepSeek (falls back to OpenAI if the key is missing).
-    job_name = context.job.name or ""
-    news_provider = "deepseek" if "2000" in job_name else "openai"
+    # Both digests use the default provider (NEWS_AI_PROVIDER, default Claude).
+    news_provider = default_ai_provider()
     block_order = ["fg", "st", "fx", "dam", "news", "ideas"]
     for idx, block_name in enumerate(block_order):
         text, html_mode = await render_block_async(
