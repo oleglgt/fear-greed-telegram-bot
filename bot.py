@@ -76,7 +76,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.0.0"
+BOT_VERSION = "v5.0.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -1665,6 +1665,14 @@ def summarize_news_best_effort(
                 translated_any = True
     if not translated_any:
         logger.warning("news summary (provider=%s): no batch produced translations", provider)
+        # Every batch failed on this provider (bad key, workspace header,
+        # outage). Rather than ship the digest in English, retry via OpenAI.
+        if provider != "openai" and os.getenv("OPENAI_API_KEY", "").strip():
+            logger.warning("news summary: retrying all batches via openai")
+            if debug_logs is not None:
+                debug_logs.append(f"Summary: {provider} produced nothing, retrying via openai")
+            summarize_news_best_effort(items, debug_logs, provider="openai")
+            return
     if debug_logs is not None:
         debug_logs.append("Summary: done" if translated_any else "Summary: skipped")
 
@@ -1752,7 +1760,14 @@ def call_claude_chat(messages: list[dict[str, str]], stage_label: str = "request
     timeout_seconds = float(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "150"))
     system_text, chat = _split_chat_messages(messages)
 
-    client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds, max_retries=3)
+    # Org-level keys (not created inside a workspace) are rejected with 400
+    # unless every request names the workspace; workspace-scoped keys must
+    # NOT send the header. ANTHROPIC_WORKSPACE_ID covers the first case.
+    workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
+    default_headers = {"anthropic-workspace-id": workspace_id} if workspace_id else None
+    client = anthropic.Anthropic(
+        api_key=api_key, timeout=timeout_seconds, max_retries=3, default_headers=default_headers
+    )
     request: dict[str, object] = {
         "model": model,
         "max_tokens": max_tokens,
@@ -1775,7 +1790,10 @@ def call_claude_chat(messages: list[dict[str, str]], stage_label: str = "request
     except anthropic.RateLimitError as exc:
         raise ValueError(f"Claude 429 at {stage_label}: {exc.message}") from exc
     except anthropic.APIStatusError as exc:
-        raise ValueError(f"Claude {exc.status_code} at {stage_label}: {exc.message[:220]}") from exc
+        hint = ""
+        if "workspace" in str(exc.message).lower():
+            hint = " [set ANTHROPIC_WORKSPACE_ID or use a key created inside a workspace]"
+        raise ValueError(f"Claude {exc.status_code} at {stage_label}: {exc.message[:220]}{hint}") from exc
     except anthropic.APITimeoutError as exc:
         raise ValueError(f"Claude timeout at {stage_label} ({timeout_seconds:.0f}s): {exc}") from exc
     except anthropic.APIConnectionError as exc:
