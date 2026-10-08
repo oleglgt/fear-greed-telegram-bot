@@ -3664,7 +3664,9 @@ async def on_startup(app) -> None:
         data=target_chat_id,
         name="daily_report_2000_cyprus",
     )
-    SCHEDULER_STATUS = "enabled: 08:00 (news: openai) and 20:00 (news: deepseek) Europe/Nicosia"
+    SCHEDULER_STATUS = (
+        f"enabled: 08:00 and 20:00 Europe/Nicosia (news AI: {default_ai_provider()})"
+    )
 
     if env_flag("SEND_DEPLOY_NOTIFICATION", True):
         try:
