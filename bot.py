@@ -78,7 +78,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.2.1"
+BOT_VERSION = "v5.3.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -278,6 +278,14 @@ EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 EDGAR_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/"
 OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
 FINNHUB_RECO_URL = "https://finnhub.io/api/v1/stock/recommendation"
+FINNHUB_TARGET_URL = "https://finnhub.io/api/v1/stock/price-target"
+YAHOO_CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
+YAHOO_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+# Analyst price-target bonus: +10 at >= IDEAS_TARGET_FULL_UPSIDE_PCT upside to
+# the median target, 0 at zero upside, down to -5 when price is >= 10% above it.
+IDEAS_TARGET_FULL_UPSIDE_PCT = 20.0
+IDEAS_TARGET_BONUS_MAX = 10.0
+IDEAS_TARGET_PENALTY_MAX = 5.0
 # CIK -> fallback label; the display name is taken from EDGAR's own response.
 IDEAS_FUNDS: dict[str, str] = {
     "0001067983": "Berkshire Hathaway",
@@ -2742,6 +2750,136 @@ def _fetch_finnhub_recommendation(ticker: str) -> dict | None:
     }
 
 
+def _fetch_finnhub_price_target(ticker: str) -> dict | None:
+    """Consensus 12-month target from Finnhub: mean/median/high/low."""
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+    response = requests.get(
+        FINNHUB_TARGET_URL, params={"symbol": ticker, "token": api_key}, timeout=HTTP_TIMEOUT_SHORT
+    )
+    if response.status_code == 403:
+        raise ValueError("finnhub price-target: 403 (premium endpoint on this plan)")
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        return None
+    mean = float(data.get("targetMean") or 0.0)
+    median = float(data.get("targetMedian") or 0.0)
+    if mean <= 0 and median <= 0:
+        return None
+    return {
+        "mean": mean or None,
+        "median": median or None,
+        "high": float(data.get("targetHigh") or 0.0) or None,
+        "low": float(data.get("targetLow") or 0.0) or None,
+        "count": None,
+        "source": "finnhub",
+    }
+
+
+_YAHOO_SESSION: dict[str, object] = {}
+
+
+def _yahoo_crumb() -> tuple[requests.Session, str]:
+    """Yahoo's quoteSummary wants a session cookie plus a matching crumb."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    sess = _YAHOO_SESSION.get("session")
+    if isinstance(sess, requests.Session) and float(_YAHOO_SESSION.get("expires_at", 0.0)) > now_ts:
+        return sess, str(_YAHOO_SESSION["crumb"])
+    sess = requests.Session()
+    sess.headers.update(REQUEST_HEADERS_GENERIC)
+    sess.get("https://fc.yahoo.com", timeout=HTTP_TIMEOUT_SHORT, allow_redirects=True)
+    crumb = sess.get(YAHOO_CRUMB_URL, timeout=HTTP_TIMEOUT_SHORT).text.strip()
+    if not crumb or "<" in crumb:
+        raise ValueError("yahoo: could not obtain crumb")
+    _YAHOO_SESSION.update({"session": sess, "crumb": crumb, "expires_at": now_ts + 3600})
+    return sess, crumb
+
+
+def _fetch_yahoo_price_target(ticker: str) -> dict | None:
+    """Consensus target from Yahoo Finance quoteSummary/financialData (unofficial)."""
+    sess, crumb = _yahoo_crumb()
+    response = sess.get(
+        YAHOO_QUOTE_SUMMARY_URL.format(symbol=ticker.upper().replace(".", "-")),
+        params={"modules": "financialData", "crumb": crumb},
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = ((data.get("quoteSummary") or {}).get("result")) or []
+    if not result:
+        raise ValueError(f"yahoo {ticker}: no financialData")
+    fin = result[0].get("financialData") or {}
+
+    def _raw(key: str) -> float | None:
+        value = fin.get(key)
+        if isinstance(value, dict):
+            value = value.get("raw")
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    mean, median = _raw("targetMeanPrice"), _raw("targetMedianPrice")
+    if not mean and not median:
+        return None
+    count = _raw("numberOfAnalystOpinions")
+    return {
+        "mean": mean,
+        "median": median,
+        "high": _raw("targetHighPrice"),
+        "low": _raw("targetLowPrice"),
+        "count": int(count) if count else None,
+        "source": "yahoo",
+    }
+
+
+def _price_target(ticker: str) -> dict | None:
+    """Finnhub first, Yahoo as fallback; cached 6h. None when neither answers."""
+    if not ticker:
+        return None
+    cache = IDEAS_CACHE.setdefault("targets", {})
+    assert isinstance(cache, dict)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    hit = cache.get(ticker)
+    if isinstance(hit, dict) and float(hit.get("expires_at", 0.0)) > now_ts:
+        return hit.get("data")
+    data = None
+    errors: list[str] = []
+    for fetcher in (_fetch_finnhub_price_target, _fetch_yahoo_price_target):
+        try:
+            data = fetcher(ticker)
+            if data:
+                break
+        except Exception as exc:
+            errors.append(f"{fetcher.__name__}: {str(exc)[:120]}")
+    if data is None and errors:
+        logger.warning("ideas: price target for %s failed: %s", ticker, "; ".join(errors))
+    cache[ticker] = {"data": data, "expires_at": now_ts + 6 * 3600}
+    return data
+
+
+def _target_upside_pct(target: dict | None, last_close: float | None) -> float | None:
+    """% distance from the latest close to the median (else mean) target."""
+    if not target or not last_close or last_close <= 0:
+        return None
+    goal = target.get("median") or target.get("mean")
+    if not goal:
+        return None
+    return (float(goal) / float(last_close) - 1.0) * 100.0
+
+
+def _target_bonus(upside_pct: float | None) -> float:
+    """+10 at >= 20% upside, linear to 0 at no upside, down to -5 when price
+    sits >= 10% above the target."""
+    if upside_pct is None:
+        return 0.0
+    if upside_pct >= 0:
+        return min(upside_pct / IDEAS_TARGET_FULL_UPSIDE_PCT, 1.0) * IDEAS_TARGET_BONUS_MAX
+    return -min(-upside_pct / 10.0, 1.0) * IDEAS_TARGET_PENALTY_MAX
+
+
 def _score_smart_money(actions: list[dict]) -> float:
     """13F half of the score, 0-50.
 
@@ -2815,11 +2953,19 @@ def _price_penalty(price_change_pct: float | None) -> float:
 
 
 def _score_idea(
-    actions: list[dict], reco: dict | None, price_change_pct: float | None = None
+    actions: list[dict],
+    reco: dict | None,
+    price_change_pct: float | None = None,
+    target_upside_pct: float | None = None,
 ) -> tuple[int, float | None]:
     """Return (score 0-100, strong_buy_ratio_or_None)."""
     analyst_score, ratio, _ = _score_analysts(reco)
-    total = _score_smart_money(actions) + analyst_score - _price_penalty(price_change_pct)
+    total = (
+        _score_smart_money(actions)
+        + analyst_score
+        - _price_penalty(price_change_pct)
+        + _target_bonus(target_upside_pct)
+    )
     return round(max(0.0, min(total, 100.0))), ratio
 
 
@@ -2926,6 +3072,27 @@ def _price_change_since(ticker: str, period: str) -> dict | None:
     return data
 
 
+def _fmt_price_target(target: dict, upside_pct: float | None) -> str:
+    """`🎯 цель: медиана $205 (+14%), средняя $210 · 18 аналитиков`."""
+    parts = []
+    if target.get("median"):
+        median_part = f"медиана ${float(target['median']):,.0f}"
+        if upside_pct is not None:
+            median_part += f" ({'+' if upside_pct >= 0 else ''}{upside_pct:.0f}%)"
+        parts.append(median_part)
+    if target.get("mean"):
+        parts.append(f"средняя ${float(target['mean']):,.0f}")
+    line = "🎯 цель: " + ", ".join(parts)
+    if target.get("count"):
+        line += f" · {target['count']} аналитиков"
+    bonus = _target_bonus(upside_pct)
+    if bonus >= 1:
+        line += f" · +{bonus:.0f}"
+    elif bonus <= -1:
+        line += f" · −{-bonus:.0f}"
+    return line
+
+
 def _fmt_short_date(iso_date: str) -> str:
     """2026-06-30 -> 30 Jun."""
     try:
@@ -3015,12 +3182,16 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             if ticker:
                 time_module.sleep(0.2)
             price_pct = float(price["pct"]) if price else None
-            score, ratio = _score_idea(entry["actions"], reco, price_pct)
-            scored.append((score, ratio, ticker, entry, reco, price))
+            target = _price_target(ticker) if ticker else None
+            if ticker and finnhub_on:
+                time_module.sleep(1.05)  # second Finnhub call per ticker
+            upside = _target_upside_pct(target, price.get("last_close") if price else None)
+            score, ratio = _score_idea(entry["actions"], reco, price_pct, upside)
+            scored.append((score, ratio, ticker, entry, reco, price, target, upside))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         lines = ["💡 Smart Money Ideas (13F китов + аналитики):", ""]
-        for idx, (score, ratio, ticker, entry, reco, price) in enumerate(
+        for idx, (score, ratio, ticker, entry, reco, price, target, upside) in enumerate(
             scored[:IDEAS_TARGET_COUNT], 1
         ):
             name = ticker or str(entry.get("issuer", "?")).title()
@@ -3052,6 +3223,8 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                 lines.append("   📈 аналитика выкл (нет FINNHUB_API_KEY)")
             elif not ticker:
                 lines.append("   📈 тикер не определён (CUSIP без маппинга)")
+            if target:
+                lines.append("   " + _fmt_price_target(target, upside))
             lines.append("")
 
         exit_rows = []
@@ -3071,7 +3244,8 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
         lines.append(f"13F за {period}, вселенная обновлена {built}. Фонды: {fund_names}")
         lines.append(
             "Score 0-100: до 50 за 13F (NEW/рост × доля в портфеле × число фондов), "
-            "до 50 за аналитиков, минус до 10 за рост акции с конца квартала."
+            "до 50 за аналитиков, минус до 10 за рост акции с конца квартала, "
+            "от −5 до +10 за апсайд к медианной цели аналитиков."
         )
         lines.append("Не инвестиционная рекомендация.")
         content = "\n".join(lines)
@@ -3109,6 +3283,14 @@ def build_ideas_debug_block() -> str:
             lines.append(f"• Finnhub AAPL: {_fetch_finnhub_recommendation('AAPL')}")
         except Exception as exc:
             lines.append(f"• Finnhub FAILED {type(exc).__name__}: {str(exc)[:140]}")
+        try:
+            lines.append(f"• Finnhub target AAPL: {_fetch_finnhub_price_target('AAPL')}")
+        except Exception as exc:
+            lines.append(f"• Finnhub target FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    try:
+        lines.append(f"• Yahoo target AAPL: {_fetch_yahoo_price_target('AAPL')}")
+    except Exception as exc:
+        lines.append(f"• Yahoo target FAILED {type(exc).__name__}: {str(exc)[:140]}")
     else:
         lines.append("• Finnhub: FINNHUB_API_KEY не задан (аналитический слой выключен)")
     today = datetime.now(timezone.utc).date()
