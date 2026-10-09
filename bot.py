@@ -77,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.3.1"
+BOT_VERSION = "v5.4.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -279,6 +279,12 @@ OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
 FINNHUB_RECO_URL = "https://finnhub.io/api/v1/stock/recommendation"
 FINNHUB_TARGET_URL = "https://finnhub.io/api/v1/stock/price-target"
 FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
+ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
+# Analyst targets are fetched for the top-N ideas only (Alpha Vantage free
+# tier: 25 requests/day) and cached on disk for a day.
+IDEAS_TARGET_LOOKUPS = 12
+IDEAS_TARGETS_FILE = "ideas_targets.json"
+IDEAS_TARGET_TTL_SECONDS = 24 * 3600
 YAHOO_CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 YAHOO_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 # Analyst price-target bonus: +10 at >= IDEAS_TARGET_FULL_UPSIDE_PCT upside to
@@ -2850,28 +2856,106 @@ def _fetch_yahoo_price_target(ticker: str) -> dict | None:
     }
 
 
+_TARGET_SOURCE_BLOCKED: dict[str, float] = {}  # source -> unix ts until which it is skipped
+
+
+def _fetch_alphavantage_target(ticker: str) -> dict | None:
+    """Mean analyst target + rating counts from Alpha Vantage OVERVIEW (free
+    tier: 25 requests/day). No median on this endpoint."""
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ALPHAVANTAGE_API_KEY is not set")
+    response = requests.get(
+        ALPHAVANTAGE_URL,
+        params={"function": "OVERVIEW", "symbol": ticker, "apikey": api_key},
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"alphavantage {ticker}: unexpected body")
+    note = data.get("Information") or data.get("Note") or data.get("Error Message")
+    if note:
+        text = str(note)
+        if "per day" in text or "rate limit" in text.lower() or "premium" in text.lower():
+            # Quota is per calendar day (UTC); stop asking until tomorrow.
+            tomorrow = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            _TARGET_SOURCE_BLOCKED["alphavantage"] = tomorrow.timestamp() + 86400
+            raise ValueError(f"alphavantage: daily quota reached ({text[:80]})")
+        raise ValueError(f"alphavantage {ticker}: {text[:120]}")
+
+    def _num(key: str) -> float | None:
+        raw = data.get(key)
+        if raw in (None, "", "None", "-"):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    mean = _num("AnalystTargetPrice")
+    if not mean or mean <= 0:
+        return None
+    counts = [
+        _num("AnalystRatingStrongBuy"), _num("AnalystRatingBuy"), _num("AnalystRatingHold"),
+        _num("AnalystRatingSell"), _num("AnalystRatingStrongSell"),
+    ]
+    count = int(sum(c for c in counts if c)) or None
+    return {"mean": mean, "median": None, "high": None, "low": None, "count": count, "source": "alphavantage"}
+
+
+def _load_targets_cache() -> dict[str, dict]:
+    try:
+        with open(IDEAS_TARGETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _price_target(ticker: str) -> dict | None:
-    """Finnhub first, Yahoo as fallback; cached 6h. None when neither answers."""
+    """Consensus target: Finnhub, then Alpha Vantage, then Yahoo. Results
+    (including \"no data\") are cached on disk for IDEAS_TARGET_TTL_SECONDS so
+    restarts do not burn the daily quotas. None when no source answers."""
     if not ticker:
         return None
-    cache = IDEAS_CACHE.setdefault("targets", {})
-    assert isinstance(cache, dict)
     now_ts = datetime.now(timezone.utc).timestamp()
+    with STATE_LOCK:
+        cache = _load_targets_cache()
     hit = cache.get(ticker)
     if isinstance(hit, dict) and float(hit.get("expires_at", 0.0)) > now_ts:
         return hit.get("data")
     data = None
     errors: list[str] = []
-    for fetcher in (_fetch_finnhub_price_target, _fetch_yahoo_price_target):
+    for source, fetcher in (
+        ("finnhub", _fetch_finnhub_price_target),
+        ("alphavantage", _fetch_alphavantage_target),
+        ("yahoo", _fetch_yahoo_price_target),
+    ):
+        if float(_TARGET_SOURCE_BLOCKED.get(source, 0.0)) > now_ts:
+            continue
         try:
             data = fetcher(ticker)
             if data:
                 break
         except Exception as exc:
-            errors.append(f"{fetcher.__name__}: {str(exc)[:120]}")
+            msg = str(exc)
+            errors.append(f"{source}: {msg[:120]}")
+            if source == "finnhub" and "premium" in msg:
+                _TARGET_SOURCE_BLOCKED["finnhub"] = now_ts + 86400
+            if source == "yahoo" and "429" in msg:
+                _TARGET_SOURCE_BLOCKED["yahoo"] = now_ts + 3600
     if data is None and errors:
         logger.warning("ideas: price target for %s failed: %s", ticker, "; ".join(errors))
-    cache[ticker] = {"data": data, "expires_at": now_ts + 6 * 3600}
+    # Do not cache a miss caused only by quota/blocks: retry next run.
+    quota_miss = data is None and errors and all(
+        ("quota" in e or "429" in e or "premium" in e or "not set" in e) for e in errors
+    )
+    if not quota_miss:
+        with STATE_LOCK:
+            cache = _load_targets_cache()
+            cache[ticker] = {"data": data, "expires_at": now_ts + IDEAS_TARGET_TTL_SECONDS}
+            atomic_write_json(IDEAS_TARGETS_FILE, cache)
     return data
 
 
@@ -3052,13 +3136,15 @@ def _price_change_since(ticker: str, period: str, period_price: float | None) ->
 def _fmt_price_target(target: dict, upside_pct: float | None) -> str:
     """`🎯 цель: медиана $205 (+14%), средняя $210 · 18 аналитиков`."""
     parts = []
+    upside_part = (
+        f" ({'+' if upside_pct >= 0 else ''}{upside_pct:.0f}%)" if upside_pct is not None else ""
+    )
     if target.get("median"):
-        median_part = f"медиана ${float(target['median']):,.0f}"
-        if upside_pct is not None:
-            median_part += f" ({'+' if upside_pct >= 0 else ''}{upside_pct:.0f}%)"
-        parts.append(median_part)
+        # Upside is measured against the median when there is one.
+        parts.append(f"медиана ${float(target['median']):,.0f}{upside_part}")
+        upside_part = ""
     if target.get("mean"):
-        parts.append(f"средняя ${float(target['mean']):,.0f}")
+        parts.append(f"средняя ${float(target['mean']):,.0f}{upside_part}")
     line = "🎯 цель: " + ", ".join(parts)
     if target.get("count"):
         line += f" · {target['count']} аналитиков"
@@ -3162,12 +3248,21 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             if ticker and finnhub_on:
                 time_module.sleep(1.05)  # Finnhub quote call
             price_pct = float(price["pct"]) if price else None
-            target = _price_target(ticker) if ticker else None
-            if ticker and finnhub_on:
-                time_module.sleep(1.05)  # second Finnhub call per ticker
+            score, ratio = _score_idea(entry["actions"], reco, price_pct, None)
+            scored.append([score, ratio, ticker, entry, reco, price, None, None])
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Analyst targets only for the leaders: the free sources are quota-
+        # bound (Alpha Vantage 25/day), and a target cannot lift a laggard by
+        # more than 10 points anyway.
+        for row in scored[:IDEAS_TARGET_LOOKUPS]:
+            score, ratio, ticker, entry, reco, price, _, _ = row
+            if not ticker:
+                continue
+            target = _price_target(ticker)
             upside = _target_upside_pct(target, price.get("last_close") if price else None)
-            score, ratio = _score_idea(entry["actions"], reco, price_pct, upside)
-            scored.append((score, ratio, ticker, entry, reco, price, target, upside))
+            row[0], _ = _score_idea(entry["actions"], reco, float(price["pct"]) if price else None, upside)
+            row[6], row[7] = target, upside
         scored.sort(key=lambda x: x[0], reverse=True)
 
         lines = ["💡 Smart Money Ideas (13F китов + аналитики):", ""]
@@ -3270,6 +3365,13 @@ def build_ideas_debug_block() -> str:
             lines.append(f"• Finnhub target AAPL: {_fetch_finnhub_price_target('AAPL')}")
         except Exception as exc:
             lines.append(f"• Finnhub target FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    if os.getenv("ALPHAVANTAGE_API_KEY", "").strip():
+        try:
+            lines.append(f"• Alpha Vantage target AAPL: {_fetch_alphavantage_target('AAPL')}")
+        except Exception as exc:
+            lines.append(f"• Alpha Vantage target FAILED {type(exc).__name__}: {str(exc)[:140]}")
+    else:
+        lines.append("• Alpha Vantage: ALPHAVANTAGE_API_KEY не задан (целевые цены выключены)")
     try:
         lines.append(f"• Yahoo target AAPL: {_fetch_yahoo_price_target('AAPL')}")
     except Exception as exc:
