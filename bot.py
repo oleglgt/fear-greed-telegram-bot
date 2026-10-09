@@ -77,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.4.0"
+BOT_VERSION = "v5.5.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -253,15 +253,35 @@ IDEAS_MIN_COVERAGE = 5  # analysts covering; below this the rating is noise
 IDEAS_CHANGE_PCT = 20.0  # shares +/-20% counts as increased/decreased
 IDEAS_CACHE: dict[str, object] = {}
 # Universe file layout version; a cached file with another version is rebuilt.
-IDEAS_UNIVERSE_SCHEMA = 3
+IDEAS_UNIVERSE_SCHEMA = 4
 # Smart-money scoring knobs. A position of this share of the fund's reported
 # portfolio (or more) counts as a full-conviction bet.
 IDEAS_FULL_WEIGHT_PCT = 5.0
-# Price run-up since the 13F period end above this starts to cost points
-# (the fund bought cheaper than you can); 1 point per IDEAS_PRICE_PENALTY_STEP %.
-IDEAS_PRICE_PENALTY_FROM_PCT = 30.0
-IDEAS_PRICE_PENALTY_STEP = 5.0
-IDEAS_PRICE_PENALTY_MAX = 10.0
+# Price move since the 13F period end -> points. Run-up: you are no longer
+# buying at the fund's price, so the penalty is convex (piecewise-linear
+# through these (pct, -points) knots; flat beyond the last one). Drawdown: a
+# modest dip is a better entry (+3 at -15%), a deep one may mean the thesis
+# broke, so the bonus stops growing and the line gets a warning.
+IDEAS_PRICE_PENALTY_CURVE: list[tuple[float, float]] = [
+    (10.0, 0.0), (20.0, 2.0), (30.0, 5.0), (40.0, 8.0), (50.0, 10.0),
+]
+IDEAS_DRAWDOWN_BONUS_START_PCT = -5.0
+IDEAS_DRAWDOWN_BONUS_FULL_PCT = -15.0
+IDEAS_DRAWDOWN_BONUS_MAX = 3.0
+IDEAS_DRAWDOWN_WARN_PCT = -30.0
+# A fund whose latest 13F period is this much older than the newest period
+# among the funds (e.g. Scion stopped filing after Q3 2025) is dropped: its
+# "moves" are stale and its "since 13F" price would span a year.
+IDEAS_STALE_FILING_DAYS = 100
+# Analyst sample-size shrinkage: score x n / (n + IDEAS_ANALYST_SHRINK_N).
+IDEAS_ANALYST_SHRINK_N = 15
+# Hand-curated context for moves that are not ordinary open-market buys.
+# Key: (fund CIK, normalized issuer). factor scales the 13F points.
+IDEAS_ACTION_FLAGS: dict[tuple[str, str], dict[str, object]] = {
+    # Alphabet sold Berkshire Class A and C shares in a June 2026 private
+    # placement (Alphabet 10-Q for Q2 2026); not a market accumulation signal.
+    ("0001067983", "ALPHABET"): {"label": "strategic/private placement", "factor": 0.5},
+}
 # Per-fund significance multiplier (CIK -> coef). Start neutral; portfolio
 # weight already favours concentrated funds, so tune these only after the
 # backtest shows a fund's picks deserve more or less trust.
@@ -2634,18 +2654,99 @@ def _map_cusips_to_tickers(cusips: list[str]) -> dict[str, str]:
     return out
 
 
+_ISSUER_NOISE_RE = re.compile(
+    r"\b(CL|CLASS|SER|SERIES)\s*[A-C]\b|\b(COM|COMMON|NEW|SHS|ORD|ADR|ADS|STK|INC|CORP|CO|LTD|PLC|HLDGS?|HOLDINGS?|THE)\b"
+    r"|[^A-Z0-9 ]"
+)
+
+
+def _normalize_issuer(name: str) -> str:
+    """'ALPHABET INC CL C' -> 'ALPHABET'; used to fold share classes together."""
+    cleaned = _ISSUER_NOISE_RE.sub(" ", name.upper())
+    return " ".join(cleaned.split())
+
+
+def _merge_share_classes(candidates: dict[str, dict]) -> dict[str, dict]:
+    """Fold GOOG/GOOGL-style share classes into one economic idea.
+
+    Candidates with the same normalized issuer are merged under the CUSIP of
+    the biggest position; a fund present in several classes contributes one
+    action with summed value/weight, so it is not double-counted."""
+    by_issuer: dict[str, list[str]] = {}
+    for cusip, entry in candidates.items():
+        key = _normalize_issuer(str(entry.get("issuer", ""))) or cusip
+        by_issuer.setdefault(key, []).append(cusip)
+
+    def _total(cusip: str) -> float:
+        return sum(float(a.get("value") or 0.0) for a in candidates[cusip]["actions"])
+
+    merged: dict[str, dict] = {}
+    for cusips in by_issuer.values():
+        if len(cusips) == 1:
+            merged[cusips[0]] = candidates[cusips[0]]
+            continue
+        cusips = sorted(cusips, key=_total, reverse=True)
+        main = dict(candidates[cusips[0]])
+        main["tickers"] = [str(candidates[c].get("ticker") or "") for c in cusips if candidates[c].get("ticker")]
+        by_fund: dict[str, dict] = {}
+        for c in cusips:
+            for a in candidates[c]["actions"]:
+                key = str(a.get("cik") or a.get("fund"))
+                if key not in by_fund:
+                    by_fund[key] = dict(a)
+                    continue
+                kept = by_fund[key]
+                for field in ("value", "weight", "prev_weight"):
+                    kept[field] = float(kept.get(field) or 0.0) + float(a.get(field) or 0.0)
+                # NEW in one class + increase in another: it is an increase of
+                # an existing Alphabet stake, report it that way.
+                if "increased" in (kept.get("action"), a.get("action")):
+                    kept["action"] = "increased"
+                    kept["pct"] = kept.get("pct") if kept.get("pct") is not None else a.get("pct")
+        main["actions"] = sorted(by_fund.values(), key=lambda a: -float(a.get("value") or 0.0))
+        merged[cusips[0]] = main
+    return merged
+
+
 def build_ideas_universe() -> dict:
     """Rebuild the candidate universe from the funds' two latest 13F filings."""
     candidates: dict[str, dict] = {}
     exits: dict[str, dict] = {}
     funds_meta: list[dict[str, str]] = []
     last_error: Exception | None = None
+    fund_rows: list[tuple[str, str, str, list[dict[str, str]]]] = []
     for cik, label in IDEAS_FUNDS.items():
         try:
             name, filings = _fund_latest_13f_filings(cik)
             if len(filings) < 2:
                 logger.warning("ideas: %s has <2 13F periods, skipped", label)
                 continue
+            fund_rows.append((cik, label, name, filings))
+        except Exception as exc:
+            last_error = exc
+            logger.warning("ideas: fund %s (CIK %s) failed: %s", label, cik, exc)
+
+    # Drop funds whose latest 13F is a quarter (or more) behind the pack.
+    newest = max((f[3][0]["period"] for f in fund_rows), default="")
+    stale_funds: list[dict[str, str]] = []
+    active_rows = []
+    for cik, label, name, filings in fund_rows:
+        try:
+            gap_days = (
+                datetime.strptime(newest, "%Y-%m-%d") - datetime.strptime(filings[0]["period"], "%Y-%m-%d")
+            ).days
+        except ValueError:
+            gap_days = 0
+        if gap_days > IDEAS_STALE_FILING_DAYS:
+            logger.warning(
+                "ideas: %s latest 13F is %s (newest %s), excluded as stale", label, filings[0]["period"], newest
+            )
+            stale_funds.append({"name": name, "cik": cik, "period": filings[0]["period"]})
+            continue
+        active_rows.append((cik, label, name, filings))
+
+    for cik, label, name, filings in active_rows:
+        try:
             cur = _fetch_13f_holdings(cik, filings[0]["acc"])
             prev = _fetch_13f_holdings(cik, filings[1]["acc"])
             buys, sells = _diff_13f(cur, prev)
@@ -2666,6 +2767,7 @@ def build_ideas_universe() -> dict:
                 c = candidates.setdefault(
                     row["cusip"], {"issuer": row["issuer"], "actions": []}
                 )
+                flag = IDEAS_ACTION_FLAGS.get((cik, _normalize_issuer(str(row["issuer"]))))
                 c["actions"].append(
                     {
                         "fund": name,
@@ -2674,6 +2776,8 @@ def build_ideas_universe() -> dict:
                         "pct": row["pct"],
                         "value": row["value"],
                         "shares": row.get("shares"),
+                        "flag": str(flag["label"]) if flag else None,
+                        "flag_factor": float(flag["factor"]) if flag else 1.0,
                         # 13F values are period-end market value, so value /
                         # shares is the close on the report date: no price
                         # history source needed for "since 13F" moves.
@@ -2713,11 +2817,13 @@ def build_ideas_universe() -> dict:
     tickers = _map_cusips_to_tickers(list(candidates) + [c for c in exits if c not in candidates])
     for cusip, entry in list(candidates.items()) + list(exits.items()):
         entry["ticker"] = tickers.get(cusip, "")
+    candidates = _merge_share_classes(candidates)
 
     universe = {
         "schema": IDEAS_UNIVERSE_SCHEMA,
         "built_at": datetime.now(timezone.utc).timestamp(),
         "funds": funds_meta,
+        "stale_funds": stale_funds,
         "candidates": candidates,
         "exits": exits,
     }
@@ -2755,13 +2861,21 @@ def _fetch_finnhub_recommendation(ticker: str) -> dict | None:
         return None
     latest = rows[0]
     baseline = rows[3] if len(rows) > 3 else rows[-1]
-    sb = int(latest.get("strongBuy", 0))
+
+    def _n(row: dict, key: str) -> int:
+        return int(row.get(key) or 0)
+
+    sb = _n(latest, "strongBuy")
     return {
         "strong_buy": sb,
-        "buy": int(latest.get("buy", 0)),
-        "hold": int(latest.get("hold", 0)),
-        "sell": int(latest.get("sell", 0)) + int(latest.get("strongSell", 0)),
-        "momentum": sb - int(baseline.get("strongBuy", 0)),
+        "buy": _n(latest, "buy"),
+        "hold": _n(latest, "hold"),
+        "sell": _n(latest, "sell") + _n(latest, "strongSell"),
+        "momentum": sb - _n(baseline, "strongBuy"),
+        "delta_buy": _n(latest, "buy") - _n(baseline, "buy"),
+        "delta_hold": _n(latest, "hold") - _n(baseline, "hold"),
+        "delta_sell": (_n(latest, "sell") + _n(latest, "strongSell"))
+        - (_n(baseline, "sell") + _n(baseline, "strongSell")),
     }
 
 
@@ -3003,6 +3117,7 @@ def _score_smart_money(actions: list[dict]) -> float:
         weight = float(action.get("weight") or 0.0)
         weight_factor = 0.15 + 0.85 * max(0.0, min(weight / IDEAS_FULL_WEIGHT_PCT, 1.0))
         coef = float(IDEAS_FUND_COEF.get(str(action.get("cik", "")), 1.0))
+        coef *= float(action.get("flag_factor") or 1.0)
         total += 30.0 * kind_factor * weight_factor * coef
         funds.add(str(action.get("fund") or action.get("cik") or len(funds)))
     if len(funds) > 1:
@@ -3025,30 +3140,87 @@ def _analyst_dispersion(reco: dict) -> float:
     return entropy / math.log(len(buckets))
 
 
-def _score_analysts(reco: dict | None) -> tuple[float, float | None, float]:
-    """Analyst half, 0-50. Returns (score, strong_buy_ratio_or_None, dispersion).
+def _analyst_breakdown(reco: dict | None) -> dict | None:
+    """Analyst half, 0-50, with its components.
 
-    ratio x 35 + 3-month strongBuy momentum x 15, minus up to 10 points when
-    analysts disagree (dispersion above 0.75)."""
+    level     = strongBuy share x 25            (what they think now)
+    momentum  = 3-month rating migration x 25   (how it is changing; weighted
+                2*dSB + dBuy - dHold - 2*dSell, relative to coverage, full at 30%)
+    dispersion: hold+sell share > 25% -> -2, > 40% -> -5
+    shrink    = n / (n + 15): 19 analysts count for ~56%, 70 for ~82%.
+    """
     if not reco:
-        return 0.0, None, 0.0
+        return None
     coverage = reco["strong_buy"] + reco["buy"] + reco["hold"] + reco["sell"]
     if coverage < IDEAS_MIN_COVERAGE:
-        return 0.0, None, 0.0
+        return {"coverage": coverage, "score": 0.0, "ratio": None, "thin": True}
     ratio = reco["strong_buy"] / coverage
-    momentum = max(-1.0, min(reco["momentum"] / 5.0, 1.0))
-    dispersion = _analyst_dispersion(reco)
-    penalty = max(0.0, (dispersion - 0.75) / 0.25) * 10.0
-    score = max(0.0, min(ratio * 35.0 + momentum * 15.0 - penalty, 50.0))
-    return score, ratio, dispersion
+    migration = (
+        2 * reco.get("momentum", 0)
+        + reco.get("delta_buy", 0)
+        - reco.get("delta_hold", 0)
+        - 2 * reco.get("delta_sell", 0)
+    ) / coverage
+    momentum = max(-1.0, min(migration / 0.3, 1.0))
+    bearish_share = (reco["hold"] + reco["sell"]) / coverage
+    if bearish_share <= 0.25:
+        dispersion_penalty = 0.0
+    elif bearish_share >= 0.40:
+        dispersion_penalty = 5.0
+    else:
+        dispersion_penalty = 2.0 + (bearish_share - 0.25) / 0.15 * 3.0
+    shrink = coverage / (coverage + IDEAS_ANALYST_SHRINK_N)
+    raw = ratio * 25.0 + momentum * 25.0 - dispersion_penalty
+    score = max(0.0, min(raw, 50.0)) * shrink
+    return {
+        "coverage": coverage,
+        "ratio": ratio,
+        "level_pts": ratio * 25.0,
+        "momentum": momentum,
+        "momentum_pts": momentum * 25.0,
+        "bearish_share": bearish_share,
+        "dispersion_penalty": dispersion_penalty,
+        "shrink": shrink,
+        "score": score,
+        "thin": False,
+    }
+
+
+def _score_analysts(reco: dict | None) -> tuple[float, float | None, float]:
+    """Analyst half, 0-50. Returns (score, strong_buy_ratio_or_None, bearish_share)."""
+    b = _analyst_breakdown(reco)
+    if not b or b.get("thin"):
+        return 0.0, None, 0.0
+    return float(b["score"]), b["ratio"], float(b["bearish_share"])
 
 
 def _price_penalty(price_change_pct: float | None) -> float:
-    """Points taken off when the stock already ran up since the 13F period end."""
-    if price_change_pct is None or price_change_pct <= IDEAS_PRICE_PENALTY_FROM_PCT:
+    """Points taken off for a run-up since the 13F period end (convex curve)."""
+    if price_change_pct is None:
         return 0.0
-    steps = (price_change_pct - IDEAS_PRICE_PENALTY_FROM_PCT) / IDEAS_PRICE_PENALTY_STEP
-    return min(steps, IDEAS_PRICE_PENALTY_MAX)
+    knots = IDEAS_PRICE_PENALTY_CURVE
+    if price_change_pct <= knots[0][0]:
+        return 0.0
+    if price_change_pct >= knots[-1][0]:
+        return knots[-1][1]
+    for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+        if x0 <= price_change_pct <= x1:
+            return y0 + (y1 - y0) * (price_change_pct - x0) / (x1 - x0)
+    return 0.0
+
+
+def _drawdown_bonus(price_change_pct: float | None) -> float:
+    """Small bonus for a dip since the 13F period end; capped, since a deep
+    fall may mean the thesis broke rather than a better entry."""
+    if price_change_pct is None or price_change_pct >= IDEAS_DRAWDOWN_BONUS_START_PCT:
+        return 0.0
+    span = IDEAS_DRAWDOWN_BONUS_START_PCT - IDEAS_DRAWDOWN_BONUS_FULL_PCT
+    frac = min((IDEAS_DRAWDOWN_BONUS_START_PCT - price_change_pct) / span, 1.0)
+    return frac * IDEAS_DRAWDOWN_BONUS_MAX
+
+
+def _price_points(price_change_pct: float | None) -> float:
+    return _drawdown_bonus(price_change_pct) - _price_penalty(price_change_pct)
 
 
 def _score_idea(
@@ -3062,7 +3234,7 @@ def _score_idea(
     total = (
         _score_smart_money(actions)
         + analyst_score
-        - _price_penalty(price_change_pct)
+        + _price_points(price_change_pct)
         + _target_bonus(target_upside_pct)
     )
     return round(max(0.0, min(total, 100.0))), ratio
@@ -3157,11 +3329,15 @@ def _fmt_price_target(target: dict, upside_pct: float | None) -> str:
 
 
 def _fmt_short_date(iso_date: str) -> str:
-    """2026-06-30 -> 30 Jun."""
+    """2026-06-30 -> 30 Jun; a past year is spelled out (30 Sep 2025)."""
     try:
-        return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d %b").lstrip("0")
+        d = datetime.strptime(iso_date, "%Y-%m-%d")
     except (TypeError, ValueError):
         return str(iso_date or "?")
+    out = d.strftime("%d %b").lstrip("0")
+    if d.year != datetime.now(timezone.utc).year:
+        out += f" {d.year}"
+    return out
 
 
 def _fmt_usd(value: float) -> str:
@@ -3197,6 +3373,8 @@ def _fmt_fund_action(action: dict) -> str:
         parts.append(f"~{_fmt_usd(value)}")
     if action.get("period"):
         parts.append(f"13F {_fmt_short_date(str(action['period']))}")
+    if action.get("flag"):
+        parts.append(f"⚑ {action['flag']}")
     return f"{fund}: " + " · ".join(parts)
 
 
@@ -3270,31 +3448,46 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             scored[:IDEAS_TARGET_COUNT], 1
         ):
             name = ticker or str(entry.get("issuer", "?")).title()
+            extra_classes = [t for t in (entry.get("tickers") or []) if t and t != ticker]
+            if extra_classes:
+                name += f" (+{'/'.join(extra_classes)})"
             icon = "🤝" if (ratio is not None and ratio >= 0.4) else "🐋"
             head = f"{idx}. {icon} {name} — {score}"
+            price_pts = 0.0
             if price:
                 pct = float(price["pct"])
+                price_pts = _price_points(pct)
                 head += (
                     f" · акция {'+' if pct >= 0 else ''}{pct:.0f}% с {_fmt_short_date(price['start_date'])}"
                     f" (${price['start_close']:,.0f} → ${price['last_close']:,.0f})"
                 )
-                penalty = _price_penalty(pct)
-                if penalty:
-                    head += f" (−{penalty:.0f} за рост)"
+                if pct <= IDEAS_DRAWDOWN_WARN_PCT:
+                    head += " ⚠️ проверить тезис"
             lines.append(head)
+            sm_pts = _score_smart_money(entry["actions"])
+            an_pts, _, _ = _score_analysts(reco)
+            tg_pts = _target_bonus(upside)
+            lines.append(
+                f"   Σ 13F {sm_pts:.0f} · аналитики {an_pts:.0f} · цена {price_pts:+.0f} · цель {tg_pts:+.0f}"
+            )
             for action in entry["actions"][:3]:
                 lines.append(f"   🐋 {_fmt_fund_action(action)}")
             if reco:
-                coverage = reco["strong_buy"] + reco["buy"] + reco["hold"] + reco["sell"]
+                b = _analyst_breakdown(reco) or {}
+                coverage = int(b.get("coverage", 0))
                 mom = reco["momentum"]
-                mom_part = f", {'+' if mom >= 0 else ''}{mom} SB за 3 мес" if mom else ""
-                if coverage >= IDEAS_MIN_COVERAGE:
-                    dispersion = _analyst_dispersion(reco)
-                    spread_part = " · мнения расходятся" if dispersion > 0.75 else ""
-                    lines.append(
-                        f"   📈 {reco['strong_buy']} strongBuy / {reco['buy']} buy / "
-                        f"{reco['hold']} hold / {reco['sell']} sell{mom_part}{spread_part}"
-                    )
+                mom_part = f" · {'+' if mom >= 0 else ''}{mom} SB за 3 мес" if mom else ""
+                if not b.get("thin"):
+                    parts = [
+                        f"   📈 {reco['strong_buy']} SB / {reco['buy']} buy / "
+                        f"{reco['hold']} hold / {reco['sell']} sell{mom_part}"
+                    ]
+                    parts.append(f"уровень {b['level_pts']:+.0f}")
+                    parts.append(f"динамика {b['momentum_pts']:+.0f}")
+                    if b["dispersion_penalty"]:
+                        parts.append(f"hold+sell {b['bearish_share'] * 100:.0f}% −{b['dispersion_penalty']:.0f}")
+                    parts.append(f"{coverage} аналитиков ×{b['shrink']:.2f}")
+                    lines.append(" · ".join(parts))
                 else:
                     lines.append(f"   📈 мало покрытия ({coverage} аналитиков)")
             elif not finnhub_on:
@@ -3320,10 +3513,17 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             datetime.fromtimestamp(float(universe.get("built_at", now_ts)), tz=timezone.utc)
         )
         lines.append(f"13F за {period}, вселенная обновлена {built}. Фонды: {fund_names}")
+        stale = universe.get("stale_funds") or []
+        if stale:
+            lines.append(
+                "Исключены (устаревший 13F): "
+                + "; ".join(f"{f['name']} ({_fmt_short_date(f['period'])})" for f in stale)
+            )
         lines.append(
             "Score 0-100: до 50 за 13F (NEW/рост × доля в портфеле × число фондов), "
-            "до 50 за аналитиков, минус до 10 за рост акции с конца квартала, "
-            "от −5 до +10 за апсайд к медианной цели аналитиков."
+            "до 50 за аналитиков (уровень + динамика − разброс, × поправка на выборку), "
+            "цена с конца квартала от −10 (рост 50%+) до +3 (просадка 15%), "
+            "от −5 до +10 за апсайд к цели аналитиков."
         )
         lines.append("Не инвестиционная рекомендация.")
         content = "\n".join(lines)
