@@ -44,7 +44,6 @@ COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&f=sd2t2ohlcv&h&e=csv"
 STOOQ_ES_FUTURES_CSV_URL = "https://stooq.com/q/l/?s=es.f&f=sd2t2ohlcv&h&e=csv"
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -78,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.3.0"
+BOT_VERSION = "v5.3.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -254,7 +253,7 @@ IDEAS_MIN_COVERAGE = 5  # analysts covering; below this the rating is noise
 IDEAS_CHANGE_PCT = 20.0  # shares +/-20% counts as increased/decreased
 IDEAS_CACHE: dict[str, object] = {}
 # Universe file layout version; a cached file with another version is rebuilt.
-IDEAS_UNIVERSE_SCHEMA = 2
+IDEAS_UNIVERSE_SCHEMA = 3
 # Smart-money scoring knobs. A position of this share of the fund's reported
 # portfolio (or more) counts as a full-conviction bet.
 IDEAS_FULL_WEIGHT_PCT = 5.0
@@ -279,6 +278,7 @@ EDGAR_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/"
 OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
 FINNHUB_RECO_URL = "https://finnhub.io/api/v1/stock/recommendation"
 FINNHUB_TARGET_URL = "https://finnhub.io/api/v1/stock/price-target"
+FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 YAHOO_CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 YAHOO_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 # Analyst price-target bonus: +10 at >= IDEAS_TARGET_FULL_UPSIDE_PCT upside to
@@ -2667,6 +2667,15 @@ def build_ideas_universe() -> dict:
                         "action": row["action"],
                         "pct": row["pct"],
                         "value": row["value"],
+                        "shares": row.get("shares"),
+                        # 13F values are period-end market value, so value /
+                        # shares is the close on the report date: no price
+                        # history source needed for "since 13F" moves.
+                        "period_price": (
+                            float(row["value"]) / float(row["shares"])
+                            if float(row.get("shares") or 0.0) > 0 and float(row.get("value") or 0.0) > 0
+                            else None
+                        ),
                         "weight": _weight(row["cusip"], cur, cur_total),
                         "prev_weight": _weight(row["cusip"], prev, prev_total),
                         "period": period,
@@ -2787,12 +2796,18 @@ def _yahoo_crumb() -> tuple[requests.Session, str]:
     sess = _YAHOO_SESSION.get("session")
     if isinstance(sess, requests.Session) and float(_YAHOO_SESSION.get("expires_at", 0.0)) > now_ts:
         return sess, str(_YAHOO_SESSION["crumb"])
+    if float(_YAHOO_SESSION.get("blocked_until", 0.0)) > now_ts:
+        raise ValueError("yahoo: skipped (rate-limited earlier this hour)")
     sess = requests.Session()
     sess.headers.update(REQUEST_HEADERS_GENERIC)
     sess.get("https://fc.yahoo.com", timeout=HTTP_TIMEOUT_SHORT, allow_redirects=True)
-    crumb = sess.get(YAHOO_CRUMB_URL, timeout=HTTP_TIMEOUT_SHORT).text.strip()
-    if not crumb or "<" in crumb:
-        raise ValueError("yahoo: could not obtain crumb")
+    crumb_resp = sess.get(YAHOO_CRUMB_URL, timeout=HTTP_TIMEOUT_SHORT)
+    if crumb_resp.status_code == 429:
+        _YAHOO_SESSION["blocked_until"] = now_ts + 3600
+        raise ValueError("yahoo: 429 Too Many Requests (cloud IP rate-limited)")
+    crumb = crumb_resp.text.strip()
+    if not crumb or "<" in crumb or " " in crumb or len(crumb) > 40:
+        raise ValueError(f"yahoo: could not obtain crumb ({crumb[:40]!r})")
     _YAHOO_SESSION.update({"session": sess, "crumb": crumb, "expires_at": now_ts + 3600})
     return sess, crumb
 
@@ -2969,107 +2984,69 @@ def _score_idea(
     return round(max(0.0, min(total, 100.0))), ratio
 
 
-def _fetch_stooq_daily_closes(symbol: str, start: str, end: str) -> list[tuple[str, float]]:
-    """Daily closes from Stooq between ISO dates start..end, oldest first."""
-    params = {
-        "s": symbol,
-        "d1": start.replace("-", ""),
-        "d2": end.replace("-", ""),
-        "i": "d",
-    }
+def _fetch_finnhub_quote(ticker: str) -> float:
+    """Current price from Finnhub /quote (free tier)."""
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("FINNHUB_API_KEY is not set")
     response = requests.get(
-        STOOQ_DAILY_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT
-    )
-    response.raise_for_status()
-    rows: list[tuple[str, float]] = []
-    for line in response.text.splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) < 5 or parts[0].lower() == "date" or parts[4] in {"", "N/D"}:
-            continue
-        try:
-            rows.append((parts[0], float(parts[4])))
-        except ValueError:
-            continue
-    if not rows:
-        # Stooq answers 200 with a text like "Exceeded the daily hits limit"
-        # or "No data" - surface it instead of a silent empty list.
-        snippet = response.text[:120].replace("\n", " | ")
-        raise ValueError(f"stooq {symbol}: no rows; body: {snippet!r}")
-    return rows
-
-
-def _fetch_yahoo_daily_closes(ticker: str, start: str, end: str) -> list[tuple[str, float]]:
-    """Daily closes from Yahoo Finance's chart endpoint (unofficial, no key)."""
-    start_ts = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
-    end_ts = int(datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
-    response = requests.get(
-        YAHOO_CHART_URL.format(symbol=ticker.upper().replace(".", "-")),
-        params={"period1": start_ts, "period2": end_ts, "interval": "1d"},
-        headers=REQUEST_HEADERS_GENERIC,
-        timeout=HTTP_TIMEOUT_SHORT,
+        FINNHUB_QUOTE_URL, params={"symbol": ticker, "token": api_key}, timeout=HTTP_TIMEOUT_SHORT
     )
     response.raise_for_status()
     data = response.json()
-    result = (data.get("chart") or {}).get("result") or []
-    if not result:
-        err = (data.get("chart") or {}).get("error")
-        raise ValueError(f"yahoo {ticker}: no result ({err})")
-    stamps = result[0].get("timestamp") or []
-    closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-    rows: list[tuple[str, float]] = []
-    for ts, close in zip(stamps, closes):
-        if close is None:
-            continue
-        rows.append((datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat(), float(close)))
-    if not rows:
-        raise ValueError(f"yahoo {ticker}: empty series")
-    return rows
+    price = float((data or {}).get("c") or 0.0) if isinstance(data, dict) else 0.0
+    if price <= 0:
+        raise ValueError(f"finnhub quote {ticker}: no price ({str(data)[:80]})")
+    return price
 
 
-def _fetch_daily_closes(ticker: str, start: str, end: str) -> list[tuple[str, float]]:
-    """Stooq first, Yahoo as fallback; raises with both reasons if neither works."""
-    errors: list[str] = []
-    try:
-        return _fetch_stooq_daily_closes(ticker.lower().replace(".", "-") + ".us", start, end)
-    except Exception as exc:
-        errors.append(str(exc)[:160])
-    try:
-        return _fetch_yahoo_daily_closes(ticker, start, end)
-    except Exception as exc:
-        errors.append(str(exc)[:160])
-    raise ValueError("; ".join(errors))
-
-
-def _price_change_since(ticker: str, period: str) -> dict | None:
-    """% change of the stock from the first close on/after `period` to the
-    latest close. Cached in IDEAS_CACHE for the block TTL. None on failure."""
-    if not ticker or not period:
+def _current_price(ticker: str) -> float | None:
+    """Latest price: Finnhub quote, then CNBC quote (both reachable from Render,
+    unlike Stooq/Yahoo). Cached 6h. None when neither answers."""
+    if not ticker:
         return None
-    cache = IDEAS_CACHE.setdefault("prices", {})
+    cache = IDEAS_CACHE.setdefault("quotes", {})
     assert isinstance(cache, dict)
-    key = f"{ticker}:{period}"
     now_ts = datetime.now(timezone.utc).timestamp()
-    hit = cache.get(key)
+    hit = cache.get(ticker)
     if isinstance(hit, dict) and float(hit.get("expires_at", 0.0)) > now_ts:
-        return hit.get("data")
-    data = None
-    try:
-        today = datetime.now(timezone.utc).date().isoformat()
-        closes = _fetch_daily_closes(ticker, period, today)
-        if len(closes) >= 2 and closes[0][1] > 0:
-            start_date, start_close = closes[0]
-            last_date, last_close = closes[-1]
-            data = {
-                "pct": (last_close - start_close) / start_close * 100.0,
-                "start_date": start_date,
-                "start_close": start_close,
-                "last_date": last_date,
-                "last_close": last_close,
-            }
-    except Exception as exc:
-        logger.warning("ideas: price change for %s since %s failed: %s", ticker, period, exc)
-    cache[key] = {"data": data, "expires_at": now_ts + 6 * 3600}
-    return data
+        return hit.get("price")
+    price = None
+    errors: list[str] = []
+    for label, fetcher in (("finnhub", _fetch_finnhub_quote), ("cnbc", _fetch_cnbc_quote_last)):
+        try:
+            price = float(fetcher(ticker))
+            if price > 0:
+                break
+            price = None
+        except Exception as exc:
+            errors.append(f"{label}: {str(exc)[:100]}")
+    if price is None and errors:
+        logger.warning("ideas: current price for %s failed: %s", ticker, "; ".join(errors))
+    cache[ticker] = {"price": price, "expires_at": now_ts + 6 * 3600}
+    return price
+
+
+def _price_change_since(ticker: str, period: str, period_price: float | None) -> dict | None:
+    """Move from the 13F period-end price (value / shares from the filing) to
+    the latest quote. None when either side is missing."""
+    if not ticker or not period or not period_price or period_price <= 0:
+        return None
+    last = _current_price(ticker)
+    if not last:
+        return None
+    start = float(period_price)
+    # Filings before 2023 reported values in thousands of dollars; if the
+    # implied price is off by ~1000x against today's quote, rescale.
+    if start * 1000.0 / last > 0.3 and start / last < 0.003:
+        start *= 1000.0
+    return {
+        "pct": (last - start) / start * 100.0,
+        "start_date": period,
+        "start_close": start,
+        "last_date": datetime.now(timezone.utc).date().isoformat(),
+        "last_close": last,
+    }
 
 
 def _fmt_price_target(target: dict, upside_pct: float | None) -> str:
@@ -3178,9 +3155,12 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                     logger.warning("finnhub %s failed: %s", ticker, exc)
                 time_module.sleep(1.05)  # 60 req/min free limit
             period = str(entry["actions"][0].get("period", "")) if entry["actions"] else ""
-            price = _price_change_since(ticker, period) if ticker else None
-            if ticker:
-                time_module.sleep(0.2)
+            period_price = next(
+                (float(a["period_price"]) for a in entry["actions"] if a.get("period_price")), None
+            )
+            price = _price_change_since(ticker, period, period_price) if ticker else None
+            if ticker and finnhub_on:
+                time_module.sleep(1.05)  # Finnhub quote call
             price_pct = float(price["pct"]) if price else None
             target = _price_target(ticker) if ticker else None
             if ticker and finnhub_on:
@@ -3199,7 +3179,10 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             head = f"{idx}. {icon} {name} — {score}"
             if price:
                 pct = float(price["pct"])
-                head += f" · акция {'+' if pct >= 0 else ''}{pct:.0f}% с {_fmt_short_date(price['start_date'])}"
+                head += (
+                    f" · акция {'+' if pct >= 0 else ''}{pct:.0f}% с {_fmt_short_date(price['start_date'])}"
+                    f" (${price['start_close']:,.0f} → ${price['last_close']:,.0f})"
+                )
                 penalty = _price_penalty(pct)
                 if penalty:
                     head += f" (−{penalty:.0f} за рост)"
@@ -3293,18 +3276,12 @@ def build_ideas_debug_block() -> str:
         lines.append(f"• Yahoo target FAILED {type(exc).__name__}: {str(exc)[:140]}")
     else:
         lines.append("• Finnhub: FINNHUB_API_KEY не задан (аналитический слой выключен)")
-    today = datetime.now(timezone.utc).date()
-    start = (today - timedelta(days=100)).isoformat()
-    for label, fetcher, symbol in (
-        ("Stooq aapl.us", _fetch_stooq_daily_closes, "aapl.us"),
-        ("Yahoo AAPL", _fetch_yahoo_daily_closes, "AAPL"),
+    for label, fetcher in (
+        ("Finnhub quote AAPL", _fetch_finnhub_quote),
+        ("CNBC quote AAPL", _fetch_cnbc_quote_last),
     ):
         try:
-            rows = fetcher(symbol, start, today.isoformat())
-            lines.append(
-                f"• {label}: {len(rows)} closes, {rows[0][0]} {rows[0][1]:.2f} -> "
-                f"{rows[-1][0]} {rows[-1][1]:.2f}"
-            )
+            lines.append(f"• {label}: {fetcher('AAPL'):.2f}")
         except Exception as exc:
             lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:160]}")
     return "\n".join(lines)
