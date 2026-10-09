@@ -77,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.6.0"
+BOT_VERSION = "v5.7.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -246,6 +246,11 @@ HOT_TARGET_COUNT = 10
 # (SEC EDGAR, free); the live layer = analyst strong-buy consensus per ticker
 # (Finnhub, free API key). CUSIP→ticker resolved via OpenFIGI (free, key optional).
 IDEAS_UNIVERSE_FILE = "ideas_universe.json"
+# Smart Money Ideas go out with the morning digest on these weekdays only
+# (0 = Monday); 13F data changes quarterly, daily repeats are noise.
+IDEAS_SCHEDULE_WEEKDAYS = frozenset(
+    int(d) for d in os.getenv("IDEAS_SCHEDULE_WEEKDAYS", "0,3").split(",") if d.strip().isdigit()
+)
 IDEAS_UNIVERSE_MAX_AGE_DAYS = 30
 IDEAS_TARGET_COUNT = 10
 IDEAS_MAX_ANALYST_LOOKUPS = 25  # Finnhub free tier is 60 req/min
@@ -4429,11 +4434,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def ideas_scheduled_now(job_name: str, now: datetime | None = None) -> bool:
+    """Ideas ride only the morning digest, on IDEAS_SCHEDULE_WEEKDAYS (Mon, Thu)."""
+    if "0800" not in job_name:
+        return False
+    local = (now or datetime.now(timezone.utc)).astimezone(CYPRUS_TZ)
+    return local.weekday() in IDEAS_SCHEDULE_WEEKDAYS
+
+
 async def scheduled_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
     # Both digests use the default provider (NEWS_AI_PROVIDER, default Claude).
     news_provider = default_ai_provider()
-    block_order = ["fg", "st", "fx", "dam", "news", "ideas"]
+    block_order = ["fg", "st", "fx", "dam", "news"]
+    if ideas_scheduled_now(context.job.name or ""):
+        block_order.append("ideas")
     for idx, block_name in enumerate(block_order):
         text, html_mode = await render_block_async(
             block_name=block_name,
@@ -4613,8 +4628,11 @@ async def on_startup(app) -> None:
         data=target_chat_id,
         name="daily_report_2000_cyprus",
     )
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    ideas_days = ", ".join(day_names[d] for d in sorted(IDEAS_SCHEDULE_WEEKDAYS) if 0 <= d < 7) or "never"
     SCHEDULER_STATUS = (
-        f"enabled: 08:00 and 20:00 Europe/Nicosia (news AI: {default_ai_provider()})"
+        f"enabled: 08:00 and 20:00 Europe/Nicosia (news AI: {default_ai_provider()}; "
+        f"ideas: {ideas_days} 08:00)"
     )
 
     if env_flag("SEND_DEPLOY_NOTIFICATION", True):
