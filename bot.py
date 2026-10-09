@@ -44,6 +44,7 @@ COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 STOOQ_SPX_CSV_URL = "https://stooq.com/q/l/?s=%5Espx&f=sd2t2ohlcv&h&e=csv"
 STOOQ_ES_FUTURES_CSV_URL = "https://stooq.com/q/l/?s=es.f&f=sd2t2ohlcv&h&e=csv"
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 FRED_SPX_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"
 FRANKFURTER_LATEST_URL = "https://api.frankfurter.app/latest"
 OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/EUR"
@@ -77,7 +78,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.2.0"
+BOT_VERSION = "v5.2.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -2830,7 +2831,9 @@ def _fetch_stooq_daily_closes(symbol: str, start: str, end: str) -> list[tuple[s
         "d2": end.replace("-", ""),
         "i": "d",
     }
-    response = requests.get(STOOQ_DAILY_URL, params=params, timeout=HTTP_TIMEOUT_SHORT)
+    response = requests.get(
+        STOOQ_DAILY_URL, params=params, headers=REQUEST_HEADERS_GENERIC, timeout=HTTP_TIMEOUT_SHORT
+    )
     response.raise_for_status()
     rows: list[tuple[str, float]] = []
     for line in response.text.splitlines():
@@ -2841,7 +2844,54 @@ def _fetch_stooq_daily_closes(symbol: str, start: str, end: str) -> list[tuple[s
             rows.append((parts[0], float(parts[4])))
         except ValueError:
             continue
+    if not rows:
+        # Stooq answers 200 with a text like "Exceeded the daily hits limit"
+        # or "No data" - surface it instead of a silent empty list.
+        snippet = response.text[:120].replace("\n", " | ")
+        raise ValueError(f"stooq {symbol}: no rows; body: {snippet!r}")
     return rows
+
+
+def _fetch_yahoo_daily_closes(ticker: str, start: str, end: str) -> list[tuple[str, float]]:
+    """Daily closes from Yahoo Finance's chart endpoint (unofficial, no key)."""
+    start_ts = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    end_ts = int(datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=ticker.upper().replace(".", "-")),
+        params={"period1": start_ts, "period2": end_ts, "interval": "1d"},
+        headers=REQUEST_HEADERS_GENERIC,
+        timeout=HTTP_TIMEOUT_SHORT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = (data.get("chart") or {}).get("result") or []
+    if not result:
+        err = (data.get("chart") or {}).get("error")
+        raise ValueError(f"yahoo {ticker}: no result ({err})")
+    stamps = result[0].get("timestamp") or []
+    closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    rows: list[tuple[str, float]] = []
+    for ts, close in zip(stamps, closes):
+        if close is None:
+            continue
+        rows.append((datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat(), float(close)))
+    if not rows:
+        raise ValueError(f"yahoo {ticker}: empty series")
+    return rows
+
+
+def _fetch_daily_closes(ticker: str, start: str, end: str) -> list[tuple[str, float]]:
+    """Stooq first, Yahoo as fallback; raises with both reasons if neither works."""
+    errors: list[str] = []
+    try:
+        return _fetch_stooq_daily_closes(ticker.lower().replace(".", "-") + ".us", start, end)
+    except Exception as exc:
+        errors.append(str(exc)[:160])
+    try:
+        return _fetch_yahoo_daily_closes(ticker, start, end)
+    except Exception as exc:
+        errors.append(str(exc)[:160])
+    raise ValueError("; ".join(errors))
 
 
 def _price_change_since(ticker: str, period: str) -> dict | None:
@@ -2858,9 +2908,8 @@ def _price_change_since(ticker: str, period: str) -> dict | None:
         return hit.get("data")
     data = None
     try:
-        symbol = ticker.lower().replace(".", "-") + ".us"
         today = datetime.now(timezone.utc).date().isoformat()
-        closes = _fetch_stooq_daily_closes(symbol, period, today)
+        closes = _fetch_daily_closes(ticker, period, today)
         if len(closes) >= 2 and closes[0][1] > 0:
             start_date, start_close = closes[0]
             last_date, last_close = closes[-1]
@@ -2872,7 +2921,7 @@ def _price_change_since(ticker: str, period: str) -> dict | None:
                 "last_close": last_close,
             }
     except Exception as exc:
-        logger.debug("ideas: price change for %s since %s failed: %s", ticker, period, exc)
+        logger.warning("ideas: price change for %s since %s failed: %s", ticker, period, exc)
     cache[key] = {"data": data, "expires_at": now_ts + 6 * 3600}
     return data
 
@@ -3062,6 +3111,20 @@ def build_ideas_debug_block() -> str:
             lines.append(f"• Finnhub FAILED {type(exc).__name__}: {str(exc)[:140]}")
     else:
         lines.append("• Finnhub: FINNHUB_API_KEY не задан (аналитический слой выключен)")
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=100)).isoformat()
+    for label, fetcher, symbol in (
+        ("Stooq aapl.us", _fetch_stooq_daily_closes, "aapl.us"),
+        ("Yahoo AAPL", _fetch_yahoo_daily_closes, "AAPL"),
+    ):
+        try:
+            rows = fetcher(symbol, start, today.isoformat())
+            lines.append(
+                f"• {label}: {len(rows)} closes, {rows[0][0]} {rows[0][1]:.2f} -> "
+                f"{rows[-1][0]} {rows[-1][1]:.2f}"
+            )
+        except Exception as exc:
+            lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:160]}")
     return "\n".join(lines)
 
 
