@@ -77,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.5.0"
+BOT_VERSION = "v5.6.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -253,7 +253,7 @@ IDEAS_MIN_COVERAGE = 5  # analysts covering; below this the rating is noise
 IDEAS_CHANGE_PCT = 20.0  # shares +/-20% counts as increased/decreased
 IDEAS_CACHE: dict[str, object] = {}
 # Universe file layout version; a cached file with another version is rebuilt.
-IDEAS_UNIVERSE_SCHEMA = 4
+IDEAS_UNIVERSE_SCHEMA = 5
 # Smart-money scoring knobs. A position of this share of the fund's reported
 # portfolio (or more) counts as a full-conviction bet.
 IDEAS_FULL_WEIGHT_PCT = 5.0
@@ -273,6 +273,14 @@ IDEAS_DRAWDOWN_WARN_PCT = -30.0
 # among the funds (e.g. Scion stopped filing after Q3 2025) is dropped: its
 # "moves" are stale and its "since 13F" price would span a year.
 IDEAS_STALE_FILING_DAYS = 100
+# Whale divergence: another tracked fund cut/exited the same name in the
+# same quarter. Points off per such fund, capped.
+IDEAS_DIVERGENCE_PENALTY_PER_FUND = 4.0
+IDEAS_DIVERGENCE_PENALTY_MAX = 8.0
+# A 13F whose total reported value is below this is taken to be in thousands
+# of dollars (some filers never switched to whole dollars); no real 13F
+# filer manages less than $100M.
+IDEAS_THOUSANDS_THRESHOLD_USD = 20e6
 # Analyst sample-size shrinkage: score x n / (n + IDEAS_ANALYST_SHRINK_N).
 IDEAS_ANALYST_SHRINK_N = 15
 # Hand-curated context for moves that are not ordinary open-market buys.
@@ -2529,20 +2537,41 @@ def _fund_latest_13f_filings(cik: str) -> tuple[str, list[dict[str, str]]]:
     name = str(data.get("name") or IDEAS_FUNDS.get(cik, cik)).title()
     recent = data.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
-    rows = [
-        {
-            "acc": recent["accessionNumber"][i],
-            "period": recent["reportDate"][i],
-            "filed": recent["filingDate"][i],
-        }
-        for i in range(len(forms))
-        if str(forms[i]).startswith("13F-HR")
-    ]
+    rows = []
+    for i in range(len(forms)):
+        if not str(forms[i]).startswith("13F-HR"):
+            continue
+        filed = str(recent["filingDate"][i])
+        period = str(recent["reportDate"][i] or "").strip()
+        if not period:
+            # EDGAR sometimes publishes the newest filing without reportDate;
+            # a 13F always covers the quarter that ended before it was filed.
+            period = _quarter_end_before(filed)
+        rows.append({"acc": recent["accessionNumber"][i], "period": period, "filed": filed})
     by_period: dict[str, dict[str, str]] = {}
     for row in rows:  # rows come newest-filed first
         by_period.setdefault(row["period"], row)
     periods = sorted(by_period, reverse=True)[:2]
     return name, [by_period[p] for p in periods]
+
+
+def _quarter_end_before(iso_date: str) -> str:
+    """Last calendar quarter end strictly before the given date."""
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
+    candidates = [datetime(d.year, m, day).date() for m, day in quarter_ends]
+    candidates.append(datetime(d.year - 1, 12, 31).date())
+    return max(q for q in candidates if q < d).isoformat()
+
+
+def _fix_13f_units(holdings: dict[str, dict[str, object]], label: str) -> dict[str, dict[str, object]]:
+    """Rescale a filing reported in thousands of dollars to whole dollars."""
+    total = sum(float(e.get("value") or 0.0) for e in holdings.values())
+    if holdings and 0 < total < IDEAS_THOUSANDS_THRESHOLD_USD:
+        logger.info("ideas: %s 13F total %.0f looks like thousands, rescaling x1000", label, total)
+        for e in holdings.values():
+            e["value"] = float(e.get("value") or 0.0) * 1000.0
+    return holdings
 
 
 def _parse_13f_infotable(xml_text: str) -> dict[str, dict[str, object]]:
@@ -2747,8 +2776,8 @@ def build_ideas_universe() -> dict:
 
     for cik, label, name, filings in active_rows:
         try:
-            cur = _fetch_13f_holdings(cik, filings[0]["acc"])
-            prev = _fetch_13f_holdings(cik, filings[1]["acc"])
+            cur = _fix_13f_units(_fetch_13f_holdings(cik, filings[0]["acc"]), label)
+            prev = _fix_13f_units(_fetch_13f_holdings(cik, filings[1]["acc"]), label)
             buys, sells = _diff_13f(cur, prev)
             # Portfolio weight = position value / total reported long value.
             cur_total = sum(float(e.get("value") or 0.0) for e in cur.values()) or 0.0
@@ -2818,6 +2847,17 @@ def build_ideas_universe() -> dict:
     for cusip, entry in list(candidates.items()) + list(exits.items()):
         entry["ticker"] = tickers.get(cusip, "")
     candidates = _merge_share_classes(candidates)
+    # Whale divergence: a tracked fund cut or exited a name another one bought.
+    exits_by_issuer: dict[str, list[dict]] = {}
+    for cusip, e in exits.items():
+        key = _normalize_issuer(str(e.get("issuer", ""))) or cusip
+        exits_by_issuer.setdefault(key, []).extend(e["actions"])
+    for cusip, entry in candidates.items():
+        key = _normalize_issuer(str(entry.get("issuer", ""))) or cusip
+        buyers = {str(a.get("cik") or a.get("fund")) for a in entry["actions"]}
+        entry["conflicts"] = [
+            a for a in exits_by_issuer.get(key, []) if str(a.get("cik") or a.get("fund")) not in buyers
+        ]
 
     universe = {
         "schema": IDEAS_UNIVERSE_SCHEMA,
@@ -3093,7 +3133,12 @@ def _target_bonus(upside_pct: float | None) -> float:
     return -min(-upside_pct / 10.0, 1.0) * IDEAS_TARGET_PENALTY_MAX
 
 
-def _score_smart_money(actions: list[dict]) -> float:
+def _divergence_penalty(conflicts: list[dict] | None) -> float:
+    funds = {str(a.get("cik") or a.get("fund")) for a in (conflicts or [])}
+    return min(len(funds) * IDEAS_DIVERGENCE_PENALTY_PER_FUND, IDEAS_DIVERGENCE_PENALTY_MAX)
+
+
+def _score_smart_money(actions: list[dict], conflicts: list[dict] | None = None) -> float:
     """13F half of the score, 0-50.
 
     Per fund action: 30 x kind x weight x fund_coef, where kind is 1.0 for a
@@ -3122,6 +3167,7 @@ def _score_smart_money(actions: list[dict]) -> float:
         funds.add(str(action.get("fund") or action.get("cik") or len(funds)))
     if len(funds) > 1:
         total *= min(1.0 + 0.25 * (len(funds) - 1), 1.5)
+    total -= _divergence_penalty(conflicts)
     return max(0.0, min(total, 50.0))
 
 
@@ -3228,11 +3274,12 @@ def _score_idea(
     reco: dict | None,
     price_change_pct: float | None = None,
     target_upside_pct: float | None = None,
+    conflicts: list[dict] | None = None,
 ) -> tuple[int, float | None]:
     """Return (score 0-100, strong_buy_ratio_or_None)."""
     analyst_score, ratio, _ = _score_analysts(reco)
     total = (
-        _score_smart_money(actions)
+        _score_smart_money(actions, conflicts)
         + analyst_score
         + _price_points(price_change_pct)
         + _target_bonus(target_upside_pct)
@@ -3328,6 +3375,17 @@ def _fmt_price_target(target: dict, upside_pct: float | None) -> str:
     return line
 
 
+def _fmt_move_short(action: dict) -> str:
+    """NEW / +489% / −58% / вышел."""
+    kind = action.get("action")
+    if kind == "new":
+        return "NEW"
+    if kind == "exited":
+        return "вышел"
+    pct = float(action.get("pct") or 0.0)
+    return f"{'+' if pct >= 0 else ''}{pct:.0f}%"
+
+
 def _fmt_short_date(iso_date: str) -> str:
     """2026-06-30 -> 30 Jun; a past year is spelled out (30 Sep 2025)."""
     try:
@@ -3402,11 +3460,15 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
 
         # Rank every candidate by the 13F half first; only the top N get the
         # paid-for lookups (Finnhub free tier, Stooq politeness).
+        # Ideas without a ticker cannot get a price, analysts or a target:
+        # they are shown separately instead of taking a Top-10 slot.
+        unmapped = [e for e in candidates.values() if not e.get("ticker")]
         ranked = sorted(
-            candidates.items(),
-            key=lambda kv: _score_smart_money(kv[1]["actions"]),
+            ((c, e) for c, e in candidates.items() if e.get("ticker")),
+            key=lambda kv: _score_smart_money(kv[1]["actions"], kv[1].get("conflicts")),
             reverse=True,
         )[:IDEAS_MAX_ANALYST_LOOKUPS]
+        suspicious: list[tuple[str, str]] = []
         finnhub_on = bool(os.getenv("FINNHUB_API_KEY", "").strip())
         scored = []
         for cusip, entry in ranked:
@@ -3425,8 +3487,13 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             price = _price_change_since(ticker, period, period_price) if ticker else None
             if ticker and finnhub_on:
                 time_module.sleep(1.05)  # Finnhub quote call
+            if price and not 0.1 <= float(price["start_close"]) / float(price["last_close"]) <= 10.0:
+                # Implied 13F price and today's quote disagree by >10x: units
+                # or mapping problem, not a trade. Keep it out of the ranking.
+                suspicious.append((ticker, f"13F ${price['start_close']:,.0f} vs quote ${price['last_close']:,.0f}"))
+                continue
             price_pct = float(price["pct"]) if price else None
-            score, ratio = _score_idea(entry["actions"], reco, price_pct, None)
+            score, ratio = _score_idea(entry["actions"], reco, price_pct, None, entry.get("conflicts"))
             scored.append([score, ratio, ticker, entry, reco, price, None, None])
         scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -3439,7 +3506,9 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                 continue
             target = _price_target(ticker)
             upside = _target_upside_pct(target, price.get("last_close") if price else None)
-            row[0], _ = _score_idea(entry["actions"], reco, float(price["pct"]) if price else None, upside)
+            row[0], _ = _score_idea(
+                entry["actions"], reco, float(price["pct"]) if price else None, upside, entry.get("conflicts")
+            )
             row[6], row[7] = target, upside
         scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -3452,26 +3521,32 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             if extra_classes:
                 name += f" (+{'/'.join(extra_classes)})"
             icon = "🤝" if (ratio is not None and ratio >= 0.4) else "🐋"
-            head = f"{idx}. {icon} {name} — {score}"
-            price_pts = 0.0
-            if price:
-                pct = float(price["pct"])
-                price_pts = _price_points(pct)
-                head += (
-                    f" · акция {'+' if pct >= 0 else ''}{pct:.0f}% с {_fmt_short_date(price['start_date'])}"
-                    f" (${price['start_close']:,.0f} → ${price['last_close']:,.0f})"
-                )
-                if pct <= IDEAS_DRAWDOWN_WARN_PCT:
-                    head += " ⚠️ проверить тезис"
-            lines.append(head)
-            sm_pts = _score_smart_money(entry["actions"])
+            price_pts = _price_points(float(price["pct"])) if price else 0.0
+            sm_pts = _score_smart_money(entry["actions"], entry.get("conflicts"))
             an_pts, _, _ = _score_analysts(reco)
             tg_pts = _target_bonus(upside)
             lines.append(
-                f"   Σ 13F {sm_pts:.0f} · аналитики {an_pts:.0f} · цена {price_pts:+.0f} · цель {tg_pts:+.0f}"
+                f"{idx}. {icon} {name} — {score} = Whale {sm_pts:.0f} + Analyst {an_pts:.0f}"
+                f" + Price {price_pts:+.0f} + Target {tg_pts:+.0f}"
             )
+            if price:
+                pct = float(price["pct"])
+                price_line = (
+                    f"   {'📈' if pct >= 0 else '📉'} акция {'+' if pct >= 0 else ''}{pct:.0f}% "
+                    f"с {_fmt_short_date(price['start_date'])} (${price['start_close']:,.0f} → ${price['last_close']:,.0f})"
+                )
+                if pct <= IDEAS_DRAWDOWN_WARN_PCT:
+                    price_line += " ⚠️ проверить тезис"
+                lines.append(price_line)
             for action in entry["actions"][:3]:
                 lines.append(f"   🐋 {_fmt_fund_action(action)}")
+            conflicts = entry.get("conflicts") or []
+            if conflicts:
+                moves = [f"{a.get('fund')} {_fmt_move_short(a)}" for a in entry["actions"][:2]]
+                moves += [f"{a.get('fund')} {_fmt_move_short(a)}" for a in conflicts[:2]]
+                lines.append(
+                    f"   ⚠ whale divergence: {', '.join(moves)} (−{_divergence_penalty(conflicts):.0f})"
+                )
             if reco:
                 b = _analyst_breakdown(reco) or {}
                 coverage = int(b.get("coverage", 0))
@@ -3479,7 +3554,7 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                 mom_part = f" · {'+' if mom >= 0 else ''}{mom} SB за 3 мес" if mom else ""
                 if not b.get("thin"):
                     parts = [
-                        f"   📈 {reco['strong_buy']} SB / {reco['buy']} buy / "
+                        f"   🧑‍💼 {reco['strong_buy']} SB / {reco['buy']} buy / "
                         f"{reco['hold']} hold / {reco['sell']} sell{mom_part}"
                     ]
                     parts.append(f"уровень {b['level_pts']:+.0f}")
@@ -3489,13 +3564,24 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                     parts.append(f"{coverage} аналитиков ×{b['shrink']:.2f}")
                     lines.append(" · ".join(parts))
                 else:
-                    lines.append(f"   📈 мало покрытия ({coverage} аналитиков)")
+                    lines.append(f"   🧑‍💼 мало покрытия ({coverage} аналитиков)")
             elif not finnhub_on:
-                lines.append("   📈 аналитика выкл (нет FINNHUB_API_KEY)")
-            elif not ticker:
-                lines.append("   📈 тикер не определён (CUSIP без маппинга)")
+                lines.append("   🧑‍💼 аналитика выкл (нет FINNHUB_API_KEY)")
             if target:
                 lines.append("   " + _fmt_price_target(target, upside))
+            lines.append("")
+
+        side_rows = []
+        for entry in sorted(unmapped, key=lambda e: -_score_smart_money(e["actions"], e.get("conflicts"))):
+            sm = _score_smart_money(entry["actions"], entry.get("conflicts"))
+            if sm < 10:
+                continue
+            first = entry["actions"][0]
+            side_rows.append(f"{str(entry.get('issuer', '?')).title()} (Whale {sm:.0f}; {_fmt_fund_action(first)})")
+        for ticker_, reason in suspicious:
+            side_rows.append(f"{ticker_} (данные не сходятся: {reason})")
+        if side_rows:
+            lines.append("⚠ Без тикера / не проверено (в рейтинг не входят): " + "; ".join(side_rows[:4]))
             lines.append("")
 
         exit_rows = []
@@ -3520,7 +3606,7 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
                 + "; ".join(f"{f['name']} ({_fmt_short_date(f['period'])})" for f in stale)
             )
         lines.append(
-            "Score 0-100: до 50 за 13F (NEW/рост × доля в портфеле × число фондов), "
+            "Score 0-100: Whale до 50 (NEW/рост × доля в портфеле × число фондов, −4 за каждого кита-продавца), "
             "до 50 за аналитиков (уровень + динамика − разброс, × поправка на выборку), "
             "цена с конца квартала от −10 (рост 50%+) до +3 (просадка 15%), "
             "от −5 до +10 за апсайд к цели аналитиков."
