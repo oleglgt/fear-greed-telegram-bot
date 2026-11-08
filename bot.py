@@ -77,7 +77,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.7.0"
+BOT_VERSION = "v5.8.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -415,8 +415,29 @@ def source_name_from_url(url: str) -> str:
     return host.lower().split(":")[0].removeprefix("www.")
 
 
+class RichStr(str):
+    """Plain/HTML text that also carries a Bot API rich-message payload
+    (InputRichMessage). Senders try sendRichMessage first and fall back to the
+    text when the payload is missing or rejected."""
+
+    rich: dict | None = None
+
+
+def with_rich(text: str, rich: dict | None) -> str:
+    if not rich:
+        return text
+    out = RichStr(text)
+    out.rich = rich
+    return out
+
+
 def with_version(text: str) -> str:
-    return f"[{BOT_VERSION}]\n{text}"
+    versioned = f"[{BOT_VERSION}]\n{text}"
+    rich = getattr(text, "rich", None)
+    if rich:
+        blocks = [{"type": "paragraph", "text": f"[{BOT_VERSION}]"}] + list(rich.get("blocks", []))
+        return with_rich(versioned, {**rich, "blocks": blocks})
+    return versioned
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -543,7 +564,36 @@ async def render_block_async(**kwargs) -> tuple[str, bool]:
         return text, False
 
 
+# After Telegram rejects sendRichMessage (old Bot API server, bad payload),
+# stop trying for a while and use the HTML layout.
+_RICH_DISABLED_UNTIL = 0.0
+
+
+async def try_send_rich(bot, chat_id: int, text: str) -> bool:
+    """Send `text`'s rich payload via sendRichMessage. True on success."""
+    global _RICH_DISABLED_UNTIL
+    rich = getattr(text, "rich", None)
+    if not rich or not env_flag("NEWS_RICH_MESSAGES", True):
+        return False
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if _RICH_DISABLED_UNTIL > now_ts:
+        return False
+    try:
+        await bot.do_api_request(
+            "sendRichMessage",
+            api_kwargs={"chat_id": chat_id, "rich_message": rich},
+        )
+        return True
+    except Exception as exc:
+        _RICH_DISABLED_UNTIL = now_ts + 6 * 3600
+        logger.warning("sendRichMessage failed, falling back to HTML for 6h: %s", exc)
+        return False
+
+
 async def send_rendered_update(update: Update, text: str, html_mode: bool) -> None:
+    chat = update.effective_chat
+    if chat is not None and await try_send_rich(update.get_bot(), chat.id, text):
+        return
     if html_mode:
         await reply_long_text_html(update, text)
     else:
@@ -553,6 +603,8 @@ async def send_rendered_update(update: Update, text: str, html_mode: bool) -> No
 async def send_rendered_chat(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, html_mode: bool
 ) -> None:
+    if await try_send_rich(context.bot, chat_id, text):
+        return
     if html_mode:
         await send_long_text_to_chat_html(context, chat_id, text)
     else:
@@ -2228,6 +2280,59 @@ def fetch_news_items_via_ai(
     return final_items, debug_logs, used_provider
 
 
+RICH_MAX_TEXT_CHARS = 30000  # Bot API limit is 32,768; keep headroom
+RICH_MAX_BLOCKS = 480  # Bot API limit is 500 incl. nested
+
+
+def _detail_paragraphs(item: dict[str, str]) -> list[str]:
+    """The story retelling as natural paragraphs (no hard wrapping)."""
+    raw = str(item.get("details_ru") or item.get("details_en") or "").strip()
+    if not raw:
+        return ["Подробности недоступны."]
+    parts = [normalize_text(line) for line in raw.splitlines()]
+    return [p for p in parts if p][:10] or ["Подробности недоступны."]
+
+
+def build_news_rich(items: list[dict[str, str]], footer: str) -> dict | None:
+    """InputRichMessage for the digest: a heading per category and one
+    collapsible `details` block per story (headline visible, retelling and
+    link inside). None when it would exceed the rich-message limits."""
+    blocks: list[dict] = [{"type": "heading", "size": 2, "text": "📰 Новости"}]
+    block_count = 1
+    text_chars = len("📰 Новости")
+    current_cat = None
+    for item in items:
+        raw_cat = item.get("category", "news")
+        cat = NEWS_CATEGORY_LABELS.get(raw_cat, raw_cat.capitalize())
+        if cat != current_cat:
+            blocks.append({"type": "heading", "size": 3, "text": cat})
+            block_count += 1
+            text_chars += len(cat)
+            current_cat = cat
+        headline = str(item.get("headline_ru") or item.get("headline_en") or "").strip()
+        meta = f" · {item.get('source', '')}, {item.get('published_at', '')}"
+        inner = [{"type": "paragraph", "text": para} for para in _detail_paragraphs(item)]
+        inner.append(
+            {"type": "paragraph", "text": [{"type": "url", "text": "Источник ↗", "url": item["url"]}]}
+        )
+        blocks.append(
+            {
+                "type": "details",
+                "summary": [{"type": "bold", "text": headline}, meta],
+                "blocks": inner,
+            }
+        )
+        block_count += 1 + len(inner)
+        text_chars += len(headline) + len(meta) + sum(len(b["text"]) for b in inner[:-1]) + 10
+    blocks.append({"type": "footer", "text": footer})
+    block_count += 1
+    text_chars += len(footer)
+    if block_count > RICH_MAX_BLOCKS or text_chars > RICH_MAX_TEXT_CHARS:
+        logger.warning("news rich payload too big (%d blocks, %d chars), HTML only", block_count, text_chars)
+        return None
+    return {"blocks": blocks, "skip_entity_detection": True}
+
+
 def build_news_block(
     force_refresh: bool = False,
     debug_mode: bool = False,
@@ -2252,7 +2357,7 @@ def build_news_block(
         cached = str(cached_entry["content"])
         if debug_mode:
             return f"News service (debug):\n- Cache: hit\n\n{cached}"
-        return cached
+        return with_rich(cached, cached_entry.get("rich"))
 
     try:
         ai_items, debug_logs, used_provider = fetch_news_items_via_ai(
@@ -2296,18 +2401,22 @@ def build_news_block(
                 lines.append(item["url"])
             lines.append("")
 
+        footer = f"Updated: {format_cyprus_time(datetime.now(timezone.utc))} | AI: {ai_label}"
         lines.append("")
-        lines.append(
-            f"Updated: {format_cyprus_time(datetime.now(timezone.utc))}"
-            f" | AI: {ai_label}"
-        )
+        lines.append(footer)
         content = "\n".join(lines)
+        rich = (
+            build_news_rich(ai_items[:max_items], footer)
+            if use_spoilers and not debug_mode and ai_items
+            else None
+        )
         NEWS_CACHE[cache_key] = {
             "content": content,
+            "rich": rich,
             "expires_at": now_ts + max(ttl, 60),
             "updated_at": now_ts,
         }
-        return content
+        return with_rich(content, rich)
     except Exception as exc:
         lines = [f"News AI: fallback ({exc})"]
         if isinstance(exc, NewsFetchError) and debug_mode and exc.debug_logs:
