@@ -45,14 +45,12 @@ YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 YAHOO_CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
 # Futures sources besides Yahoo/Stooq. CNBC answers {"code", "symbol"} only for
-# symbols it does not know (that is what @ES.1/@ES/ES.1 returned in v5.8.0);
-# @SP.1 is the S&P 500 futures symbol on CNBC's own pre-markets page. All
-# candidates go in one request, the first one with a price wins.
-CNBC_ES_FUTURES_SYMBOLS = ("@SP.1", "@ES.1", "@SP", "ES.1")
+# symbols it does not know (@ES.1/@ES/ES.1 did that in v5.8.0); @SP.1 is the
+# S&P 500 futures symbol on CNBC's own pre-markets page (live since v5.9.0).
+CNBC_ES_FUTURES_SYMBOLS = ("@SP.1",)
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/{market}/scan"
 TRADINGVIEW_ES_TICKER = "CME_MINI:ES1!"
 TRADINGVIEW_SCAN_MARKETS = ("futures", "global")
-CME_ES_QUOTES_URL = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/133/G"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 # Stooq /q/l/ answers 404 without the full field spec (f=...&e=csv).
@@ -92,7 +90,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.9.0"
+BOT_VERSION = "v5.9.1"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -936,7 +934,7 @@ def browser_request(method: str, url: str, **kwargs):
 
     Yahoo answers 429 "Too Many Requests" to the python-requests fingerprint
     no matter how rare the requests are (same reason yfinance moved to
-    curl_cffi); CME's Akamai front does the same with 403. curl_cffi sets
+    curl_cffi). curl_cffi sets
     Chrome's own headers, so ours are only used by the plain-requests fallback
     when curl_cffi is not installed.
     """
@@ -1247,22 +1245,6 @@ def _fetch_tradingview_es_futures() -> float:
     raise ValueError("TradingView ES1!: " + "; ".join(errors))
 
 
-def _fetch_cme_es_futures() -> float:
-    """CME Group's own quotes JSON for E-mini S&P 500 (product 133); the
-    first contract with a numeric last trade is the front month."""
-    response = browser_request("GET", CME_ES_QUOTES_URL)
-    if response.status_code != 200:
-        raise ValueError(f"CME: HTTP {response.status_code}")
-    quotes = response.json().get("quotes") or []
-    for quote in quotes:
-        raw = str(quote.get("last") or "").replace(",", "").strip()
-        try:
-            return float(raw)
-        except ValueError:
-            continue
-    raise ValueError(f"CME: no numeric last in {len(quotes)} contracts")
-
-
 def _fetch_coinbase_btc() -> float:
     response = requests.get(
         COINBASE_BTC_URL, params={"currency": "USD"}, timeout=HTTP_TIMEOUT_SHORT
@@ -1337,8 +1319,6 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     if spx_futures is None:
         spx_futures = _try_source("tradingview_es", _fetch_tradingview_es_futures)
     if spx_futures is None:
-        spx_futures = _try_source("cme_es", _fetch_cme_es_futures)
-    if spx_futures is None:
         spx_futures = _try_source("stooq_es", _fetch_stooq_es_futures)
     if spx_price is None:
         spx_price = _try_source("cnbc", _fetch_cnbc_spx)
@@ -1383,7 +1363,7 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
 def build_st_debug_block() -> str:
     """Probe every market data source with raw values/errors — shows why the
     futures (pre-/after-market) line is missing when it is."""
-    lines = ["Market sources probe:", f"• http client (Yahoo/TV/CME): {browser_client_label()}"]
+    lines = ["Market sources probe:", f"• http client (Yahoo/TradingView): {browser_client_label()}"]
 
     try:
         response = browser_request(
@@ -1412,7 +1392,6 @@ def build_st_debug_block() -> str:
         ("cnbc .SPX", _fetch_cnbc_spx),
         ("cnbc futures " + "|".join(CNBC_ES_FUTURES_SYMBOLS), _fetch_cnbc_futures),
         ("tradingview " + TRADINGVIEW_ES_TICKER, _fetch_tradingview_es_futures),
-        ("cme E-mini", _fetch_cme_es_futures),
         ("stooq es.f", _fetch_stooq_es_futures),
         ("coinbase BTC", _fetch_coinbase_btc),
         ("coingecko BTC", _fetch_coingecko_btc),
