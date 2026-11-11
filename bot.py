@@ -51,6 +51,12 @@ CNBC_ES_FUTURES_SYMBOLS = ("@SP.1",)
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/{market}/scan"
 TRADINGVIEW_ES_TICKER = "CME_MINI:ES1!"
 TRADINGVIEW_SCAN_MARKETS = ("futures", "global")
+# E-mini S&P 500 lists quarterly contracts; ES=F / @SP.1 / ES1! all follow the
+# front one. CME's roll date (volume moves to the next quarter) is the Thursday
+# 8 days before expiry; expiry is the 3rd Friday of the contract month.
+ES_QUARTER_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
+ES_ROLL_DAYS_BEFORE_EXPIRY = 8
+CME_TZ = ZoneInfo("America/Chicago")
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 # Stooq /q/l/ answers 404 without the full field spec (f=...&e=csv).
@@ -90,7 +96,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.9.1"
+BOT_VERSION = "v5.10.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -957,14 +963,16 @@ def browser_client_label() -> str:
         return "curl_cffi (chrome)"
 
 
-def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None]:
-    """Return (btc, spx_cash, spx_futures). ES=F trades ~23/5, so it doubles as the
-    pre-/after-market proxy for S&P 500 — much more accurate than SPY×10."""
+def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None, str | None]:
+    """Return (btc, spx_cash, spx_futures, futures_name). ES=F trades ~23/5, so it
+    doubles as the pre-/after-market proxy for S&P 500 — much more accurate than
+    SPY×10. futures_name ("E-Mini S&P 500 Dec 26") names the contract month."""
     response = browser_request(
         "GET", YAHOO_QUOTE_URL, params={"symbols": "BTC-USD,^GSPC,ES=F"}
     )
     response.raise_for_status()
     btc = spx = futures = None
+    futures_name: str | None = None
     for item in response.json()["quoteResponse"]["result"]:
         price = item.get("regularMarketPrice")
         if price is None:
@@ -976,7 +984,8 @@ def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None]:
             spx = float(price)
         elif sym == "ES=F":
             futures = float(price)
-    return btc, spx, futures
+            futures_name = item.get("shortName") or item.get("longName")
+    return btc, spx, futures, futures_name
 
 
 def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
@@ -1123,9 +1132,9 @@ def _fetch_cnbc_spx() -> float:
     return _fetch_cnbc_quote_last(".SPX")
 
 
-def _fetch_cnbc_futures() -> float:
-    """CNBC S&P 500 front-month futures: every symbol in CNBC_ES_FUTURES_SYMBOLS
-    in one request, first one with a price wins.
+def _fetch_cnbc_futures() -> tuple[float, str | None]:
+    """CNBC S&P 500 front-month futures: (price, contract name). Every symbol in
+    CNBC_ES_FUTURES_SYMBOLS goes in one request, first one with a price wins.
 
     Bare 'ES' is never a candidate: it collides with NYSE:ES (Eversource
     Energy stock, ~$70) — in v2.7.2 that surfaced as a '-99% vs cash' reading.
@@ -1140,17 +1149,25 @@ def _fetch_cnbc_futures() -> float:
         try:
             if sym not in entries:  # batch failed or dropped it: ask alone
                 entries.update(_fetch_cnbc_entries([sym]))
-            return _cnbc_entry_price(entries, sym)
+            price = _cnbc_entry_price(entries, sym)
         except Exception as exc:
             errors.append(str(exc)[:80])
+            continue
+        entry = entries[sym]
+        names = [
+            str(entry[key])
+            for key in ("name", "shortName", "altName", "onAirName")
+            if entry.get(key)
+        ]
+        return price, " | ".join(names) or None
     raise ValueError("CNBC futures: " + "; ".join(errors))
 
 
-def _fetch_yahoo_chart_price(symbol: str) -> float:
-    """Yahoo v8 chart meta price — crumb-free endpoint that keeps working when
-    the v7 quote API answers 401 (Invalid Crumb). For ES=F the meta price is
-    live nearly 24/5, which is what makes the futures line usable as the
-    pre-/after-market proxy. Tries query1, then query2."""
+def _fetch_yahoo_chart_meta(symbol: str) -> dict:
+    """Yahoo v8 chart meta (price, names, times) — crumb-free endpoint that
+    keeps working when the v7 quote API answers 401 (Invalid Crumb). For ES=F
+    the meta price is live nearly 24/5, which is what makes the futures line
+    usable as the pre-/after-market proxy. Tries query1, then query2."""
     errors = []
     for host in YAHOO_CHART_HOSTS:
         url = YAHOO_CHART_URL.format(symbol=symbol).replace(
@@ -1162,14 +1179,24 @@ def _fetch_yahoo_chart_price(symbol: str) -> float:
             )
             if response.status_code != 200:
                 raise ValueError(f"HTTP {response.status_code}")
-            result = response.json()["chart"]["result"][0]
-            price = result.get("meta", {}).get("regularMarketPrice")
-            if price is None:
+            meta = response.json()["chart"]["result"][0].get("meta") or {}
+            if meta.get("regularMarketPrice") is None:
                 raise ValueError("no meta price")
-            return float(price)
+            return meta
         except Exception as exc:
             errors.append(f"{host.split('.')[0]}: {str(exc)[:80]}")
     raise ValueError(f"yahoo chart {symbol}: " + "; ".join(errors))
+
+
+def _fetch_yahoo_chart_price(symbol: str) -> float:
+    return float(_fetch_yahoo_chart_meta(symbol)["regularMarketPrice"])
+
+
+def _fetch_yahoo_es_futures() -> tuple[float, str | None]:
+    """ES=F via the v8 chart: (price, contract name like "E-Mini S&P 500 Dec 26")."""
+    meta = _fetch_yahoo_chart_meta("ES=F")
+    name = meta.get("shortName") or meta.get("longName")
+    return float(meta["regularMarketPrice"]), name
 
 
 def _fetch_cnbc_entries(symbols) -> dict[str, dict]:
@@ -1219,7 +1246,7 @@ def _fetch_cnbc_quote_last(symbol: str) -> float:
     return _cnbc_entry_price(_fetch_cnbc_entries([symbol]), symbol)
 
 
-def _fetch_tradingview_es_futures() -> float:
+def _fetch_tradingview_es_futures() -> tuple[float, str | None]:
     """TradingView public scanner, CME_MINI:ES1! (continuous E-mini front
     month). No key; quotes are delayed for anonymous use, which is fine for a
     pre-/after-market direction signal."""
@@ -1238,7 +1265,7 @@ def _fetch_tradingview_es_futures() -> float:
             for row in response.json().get("data") or []:
                 values = row.get("d") or []
                 if values and values[0] is not None:
-                    return float(values[0])
+                    return float(values[0]), None
             raise ValueError(f"no close (body: {normalize_text(response.text)[:80]})")
         except Exception as exc:
             errors.append(f"{market}: {str(exc)[:80]}")
@@ -1270,7 +1297,7 @@ def _fetch_stooq_spx() -> float:
     return price
 
 
-def _fetch_stooq_es_futures() -> float:
+def _fetch_stooq_es_futures() -> tuple[float, str | None]:
     """Stooq continuous E-mini S&P 500 futures (es.f) — last-resort futures
     source for when Yahoo is rate-limited and CNBC misbehaves. The ±10%%
     vs-cash sanity check in fetch_market_prices guards against this symbol
@@ -1278,7 +1305,7 @@ def _fetch_stooq_es_futures() -> float:
     response = requests.get(STOOQ_ES_FUTURES_CSV_URL, timeout=HTTP_TIMEOUT_SHORT)
     response.raise_for_status()
     price, _ = parse_stooq_csv_line(response.text)
-    return price
+    return price, None
 
 
 def _fetch_fred_spx() -> float:
@@ -1293,8 +1320,70 @@ def _fetch_fred_spx() -> float:
     raise ValueError("FRED: no numeric row")
 
 
-def fetch_market_prices() -> tuple[float, float, float | None]:
-    """Return (btc_price, spx_price, spx_futures_or_None).
+_MONTH_NAMES = (
+    ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+    ("may", "may"), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+    ("sep", "september"), ("oct", "october"), ("nov", "november"), ("dec", "december"),
+)
+_MONTH_BY_NAME = {
+    name: index + 1 for index, pair in enumerate(_MONTH_NAMES) for name in pair
+}
+_MONTH_BY_NAME["sept"] = 9
+_CONTRACT_MONTH_RE = re.compile(
+    r"\b(" + "|".join(sorted(_MONTH_BY_NAME, key=len, reverse=True)) + r")\b"
+    r"\.?\s*['\u2019]?\s*(\d{4}|\d{2})\b",
+    re.IGNORECASE,
+)
+
+
+def _third_friday(year: int, month: int):
+    first = datetime(year, month, 1).date()
+    return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+
+
+def es_front_contract(today=None) -> tuple[int, int]:
+    """(year, month) of the E-mini quarter that carries the volume on `today`
+    (CME calendar): switches to the next quarter on the roll date."""
+    today = today or datetime.now(CME_TZ).date()
+    year, month = today.year, (today.month + 2) // 3 * 3
+    while today >= _third_friday(year, month) - timedelta(days=ES_ROLL_DAYS_BEFORE_EXPIRY):
+        month += 3
+        if month > 12:
+            year, month = year + 1, month - 12
+    return year, month
+
+
+def parse_contract_month(text: str | None, today=None) -> tuple[int, int] | None:
+    """Quarterly contract month named in a source's instrument name
+    ("E-Mini S&P 500 Dec 26", "S&P 500 Fut (Dec'26)"), if it is plausible:
+    not expired, at most ~2 quarters ahead."""
+    today = today or datetime.now(CME_TZ).date()
+    for match in _CONTRACT_MONTH_RE.finditer(text or ""):
+        month = _MONTH_BY_NAME[match.group(1).lower()]
+        if month not in ES_QUARTER_CODES:
+            continue
+        year = int(match.group(2))
+        year += 2000 if year < 100 else 0
+        expiry = _third_friday(year, month)
+        if today <= expiry <= today + timedelta(days=200):
+            return year, month
+    return None
+
+
+def es_contract_label(source_name: str | None = None, today=None) -> str:
+    """'ESZ26, до 18 Dec': contract month from the source's own name when it
+    gives one, else from the CME roll calendar (around the roll date the
+    calendar can be a few days ahead of a source that rolls late)."""
+    year, month = parse_contract_month(source_name, today) or es_front_contract(today)
+    expiry = _third_friday(year, month)
+    return f"ES{ES_QUARTER_CODES[month]}{year % 100:02d}, до {expiry.day} {expiry:%b}"
+
+
+def fetch_market_prices() -> tuple[float, float, float | None, str | None]:
+    """Return (btc_price, spx_price, spx_futures_or_None, futures_name_or_None).
+
+    futures_name is the source's instrument name (names the contract month)
+    when the source gives one; feed it to es_contract_label().
 
     spx_futures is the ES=F E-mini S&P 500 futures price when available; during
     regular hours it tracks the cash index with small basis, off-hours it acts
@@ -1305,21 +1394,23 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     btc_price: float | None = None
     spx_price: float | None = None
     spx_futures: float | None = None
+    futures_name: str | None = None
 
     yahoo = _try_source("yahoo", _fetch_yahoo_btc_spx)
     if yahoo:
-        btc_price, spx_price, spx_futures = yahoo
+        btc_price, spx_price, spx_futures, futures_name = yahoo
 
-    if spx_futures is None:
-        spx_futures = _try_source(
-            "yahoo_chart_es", lambda: _fetch_yahoo_chart_price("ES=F")
-        )
-    if spx_futures is None:
-        spx_futures = _try_source("cnbc_es", _fetch_cnbc_futures)
-    if spx_futures is None:
-        spx_futures = _try_source("tradingview_es", _fetch_tradingview_es_futures)
-    if spx_futures is None:
-        spx_futures = _try_source("stooq_es", _fetch_stooq_es_futures)
+    for label, fetch in (
+        ("yahoo_chart_es", _fetch_yahoo_es_futures),
+        ("cnbc_es", _fetch_cnbc_futures),
+        ("tradingview_es", _fetch_tradingview_es_futures),
+        ("stooq_es", _fetch_stooq_es_futures),
+    ):
+        if spx_futures is not None:
+            break
+        got = _try_source(label, fetch)
+        if got:
+            spx_futures, futures_name = got
     if spx_price is None:
         spx_price = _try_source("cnbc", _fetch_cnbc_spx)
     if spx_price is None:
@@ -1355,9 +1446,9 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
             "spx_futures=%.2f discarded (far from spx=%.2f, likely wrong symbol)",
             spx_futures, spx_price,
         )
-        spx_futures = None
+        spx_futures = futures_name = None
 
-    return btc_price, spx_price, spx_futures
+    return btc_price, spx_price, spx_futures, futures_name
 
 
 def build_st_debug_block() -> str:
@@ -1388,7 +1479,7 @@ def build_st_debug_block() -> str:
 
     for label, fetch in (
         ("yahoo v8 chart ^GSPC", lambda: _fetch_yahoo_chart_price("^GSPC")),
-        ("yahoo v8 chart ES=F", lambda: _fetch_yahoo_chart_price("ES=F")),
+        ("yahoo v8 chart ES=F", _fetch_yahoo_es_futures),
         ("cnbc .SPX", _fetch_cnbc_spx),
         ("cnbc futures " + "|".join(CNBC_ES_FUTURES_SYMBOLS), _fetch_cnbc_futures),
         ("tradingview " + TRADINGVIEW_ES_TICKER, _fetch_tradingview_es_futures),
@@ -1399,9 +1490,21 @@ def build_st_debug_block() -> str:
         ("fred SP500", _fetch_fred_spx),
     ):
         try:
-            lines.append(f"• {label}: {fetch():,.2f}")
+            result = fetch()
+            if isinstance(result, tuple):  # futures: (price, contract name)
+                price, name = result
+                contract = es_contract_label(name)
+                source = repr(name) if name else "no name, calendar"
+                lines.append(f"• {label}: {price:,.2f} [{source} → {contract}]")
+            else:
+                lines.append(f"• {label}: {result:,.2f}")
         except Exception as exc:
             lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:220]}")
+    roll_year, roll_month = es_front_contract()
+    roll_date = _third_friday(roll_year, roll_month) - timedelta(days=ES_ROLL_DAYS_BEFORE_EXPIRY)
+    lines.append(
+        f"• ES calendar: {es_contract_label()} (roll to next quarter {roll_date.day} {roll_date:%b})"
+    )
 
     lines.append("")
     lines.append("Пришлите этот вывод — по нему чинится строка futures/pre-market в /st.")
@@ -4299,17 +4402,23 @@ def build_st_block() -> str:
     prev_st = state.get("st")
     prev_st_dict = prev_st if isinstance(prev_st, dict) else {}
     try:
-        btc_price, spx_price, spx_futures = fetch_market_prices()
+        btc_price, spx_price, spx_futures, futures_name = fetch_market_prices()
         btc_line = f"Bitcoin (BTC-USD): ${btc_price:,.2f}"
         spx_line = f"S&P 500 (^GSPC): {spx_price:,.2f}"
         if spx_futures is not None:
             pct = (spx_futures - spx_price) / spx_price * 100
             sign = "+" if pct >= 0 else ""
-            futures_line = f"\nS&P 500 Futures (ES=F): {spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
+            futures_line = (
+                f"\nS&P 500 Futures ({es_contract_label(futures_name)}): "
+                f"{spx_futures:,.2f} ({sign}{pct:.2f}% vs cash)"
+            )
         else:
             # Surface the failure instead of silently dropping the line: the
             # futures price is the pre-/after-market signal for S&P 500.
-            futures_line = "\nS&P 500 Futures (ES=F): n/a (источники недоступны, детали: /st debug)"
+            futures_line = (
+                f"\nS&P 500 Futures ({es_contract_label()}): "
+                "n/a (источники недоступны, детали: /st debug)"
+            )
 
         btc_wk, spx_wk = _fetch_week_ago_prices()
         if btc_wk:
