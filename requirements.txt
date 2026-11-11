@@ -1,4 +1,5 @@
 python-dotenv==1.0.1
 python-telegram-bot[job-queue]==21.7
 requests==2.32.3
+curl_cffi==0.13.0
 anthropic==1.12.1
