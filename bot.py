@@ -27,6 +27,11 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Upd
 from telegram.error import RetryAfter
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 
+try:  # Chrome TLS/HTTP2 fingerprint; optional, see browser_request()
+    from curl_cffi import requests as browser_requests
+except ImportError:
+    browser_requests = None
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -38,6 +43,16 @@ CRYPTO_API_URL = "https://api.alternative.me/fng/?limit=8"
 YAHOO_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+# Futures sources besides Yahoo/Stooq. CNBC answers {"code", "symbol"} only for
+# symbols it does not know (that is what @ES.1/@ES/ES.1 returned in v5.8.0);
+# @SP.1 is the S&P 500 futures symbol on CNBC's own pre-markets page. All
+# candidates go in one request, the first one with a price wins.
+CNBC_ES_FUTURES_SYMBOLS = ("@SP.1", "@ES.1", "@SP", "ES.1")
+TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/{market}/scan"
+TRADINGVIEW_ES_TICKER = "CME_MINI:ES1!"
+TRADINGVIEW_SCAN_MARKETS = ("futures", "global")
+CME_ES_QUOTES_URL = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/133/G"
 COINGECKO_BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/spot"
 # Stooq /q/l/ answers 404 without the full field spec (f=...&e=csv).
@@ -77,7 +92,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.8.0"
+BOT_VERSION = "v5.9.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -916,14 +931,39 @@ def _try_source(label: str, fetch):
         return None
 
 
+def browser_request(method: str, url: str, **kwargs):
+    """HTTP request with a real Chrome TLS/HTTP2 fingerprint (curl_cffi).
+
+    Yahoo answers 429 "Too Many Requests" to the python-requests fingerprint
+    no matter how rare the requests are (same reason yfinance moved to
+    curl_cffi); CME's Akamai front does the same with 403. curl_cffi sets
+    Chrome's own headers, so ours are only used by the plain-requests fallback
+    when curl_cffi is not installed.
+    """
+    kwargs.setdefault("timeout", HTTP_TIMEOUT_SHORT)
+    if browser_requests is not None:
+        kwargs.pop("headers", None)
+        return browser_requests.request(method, url, impersonate="chrome", **kwargs)
+    kwargs.setdefault("headers", REQUEST_HEADERS_GENERIC)
+    return requests.request(method, url, **kwargs)
+
+
+def browser_client_label() -> str:
+    if browser_requests is None:
+        return "python-requests (curl_cffi not installed)"
+    try:
+        import curl_cffi
+
+        return f"curl_cffi {curl_cffi.__version__} (chrome)"
+    except Exception:
+        return "curl_cffi (chrome)"
+
+
 def _fetch_yahoo_btc_spx() -> tuple[float | None, float | None, float | None]:
     """Return (btc, spx_cash, spx_futures). ES=F trades ~23/5, so it doubles as the
     pre-/after-market proxy for S&P 500 — much more accurate than SPY×10."""
-    response = requests.get(
-        YAHOO_QUOTE_URL,
-        params={"symbols": "BTC-USD,^GSPC,ES=F"},
-        headers=REQUEST_HEADERS_GENERIC,
-        timeout=HTTP_TIMEOUT_SHORT,
+    response = browser_request(
+        "GET", YAHOO_QUOTE_URL, params={"symbols": "BTC-USD,^GSPC,ES=F"}
     )
     response.raise_for_status()
     btc = spx = futures = None
@@ -949,11 +989,10 @@ def _fetch_yahoo_week_ago_prices() -> tuple[float | None, float | None]:
     (weekdays only); we pick the close whose timestamp is nearest to 7 days
     ago (falling back to the oldest close if timestamps are missing).
     """
-    response = requests.get(
+    response = browser_request(
+        "GET",
         YAHOO_SPARK_URL,
         params={"symbols": "BTC-USD,^GSPC", "range": "10d", "interval": "1d"},
-        headers=REQUEST_HEADERS_GENERIC,
-        timeout=HTTP_TIMEOUT_SHORT,
     )
     response.raise_for_status()
     target_ts = datetime.now(timezone.utc).timestamp() - 7 * 86400
@@ -1087,46 +1126,60 @@ def _fetch_cnbc_spx() -> float:
 
 
 def _fetch_cnbc_futures() -> float:
-    """Try known CNBC symbol variants for E-mini S&P 500 front-month futures.
+    """CNBC S&P 500 front-month futures: every symbol in CNBC_ES_FUTURES_SYMBOLS
+    in one request, first one with a price wins.
 
-    Restricted to futures-specific symbol formats. Bare 'ES' is excluded because
-    it collides with NYSE:ES (Eversource Energy stock, ~$70) — in v2.7.2 that
-    collision surfaced as a '-99% vs cash' nonsense reading on /st.
+    Bare 'ES' is never a candidate: it collides with NYSE:ES (Eversource
+    Energy stock, ~$70) — in v2.7.2 that surfaced as a '-99% vs cash' reading.
     """
-    last_err: Exception | None = None
-    for sym in ("@ES.1", "@ES", "ES.1"):
+    errors = []
+    try:
+        entries = _fetch_cnbc_entries(CNBC_ES_FUTURES_SYMBOLS)
+    except Exception as exc:
+        entries = {}
+        errors.append(f"batch: {str(exc)[:80]}")
+    for sym in CNBC_ES_FUTURES_SYMBOLS:
         try:
-            return _fetch_cnbc_quote_last(sym)
-        except (ValueError, requests.RequestException) as exc:
-            last_err = exc
-            continue
-    raise ValueError(f"CNBC: no ES futures symbol worked (last: {last_err})")
+            if sym not in entries:  # batch failed or dropped it: ask alone
+                entries.update(_fetch_cnbc_entries([sym]))
+            return _cnbc_entry_price(entries, sym)
+        except Exception as exc:
+            errors.append(str(exc)[:80])
+    raise ValueError("CNBC futures: " + "; ".join(errors))
 
 
 def _fetch_yahoo_chart_price(symbol: str) -> float:
     """Yahoo v8 chart meta price — crumb-free endpoint that keeps working when
-    the v7 quote API answers 401 (Invalid Crumb) or 429. For ES=F the meta
-    price is live nearly 24/5, which is what makes the futures line usable as
-    the pre-/after-market proxy."""
-    response = requests.get(
-        YAHOO_CHART_URL.format(symbol=symbol),
-        params={"range": "1d", "interval": "5m"},
-        headers=REQUEST_HEADERS_GENERIC,
-        timeout=HTTP_TIMEOUT_SHORT,
-    )
-    response.raise_for_status()
-    result = response.json()["chart"]["result"][0]
-    price = result.get("meta", {}).get("regularMarketPrice")
-    if price is None:
-        raise ValueError(f"yahoo chart: no meta price for {symbol}")
-    return float(price)
+    the v7 quote API answers 401 (Invalid Crumb). For ES=F the meta price is
+    live nearly 24/5, which is what makes the futures line usable as the
+    pre-/after-market proxy. Tries query1, then query2."""
+    errors = []
+    for host in YAHOO_CHART_HOSTS:
+        url = YAHOO_CHART_URL.format(symbol=symbol).replace(
+            "query1.finance.yahoo.com", host
+        )
+        try:
+            response = browser_request(
+                "GET", url, params={"range": "1d", "interval": "5m"}
+            )
+            if response.status_code != 200:
+                raise ValueError(f"HTTP {response.status_code}")
+            result = response.json()["chart"]["result"][0]
+            price = result.get("meta", {}).get("regularMarketPrice")
+            if price is None:
+                raise ValueError("no meta price")
+            return float(price)
+        except Exception as exc:
+            errors.append(f"{host.split('.')[0]}: {str(exc)[:80]}")
+    raise ValueError(f"yahoo chart {symbol}: " + "; ".join(errors))
 
 
-def _fetch_cnbc_quote_last(symbol: str) -> float:
+def _fetch_cnbc_entries(symbols) -> dict[str, dict]:
+    """CNBC quote service for one or more symbols ('|'-joined), keyed by symbol."""
     response = requests.get(
         CNBC_QUOTE_URL,
         params={
-            "symbols": symbol,
+            "symbols": "|".join(symbols),
             "requestMethod": "itv",
             "noBody": "1",
             "partnerId": "2",
@@ -1138,14 +1191,15 @@ def _fetch_cnbc_quote_last(symbol: str) -> float:
     )
     response.raise_for_status()
     quotes = response.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
-    entry = None
-    for q in quotes:
-        if q.get("symbol") == symbol:
-            entry = q
-            break
+    if isinstance(quotes, dict):  # a single quote can arrive unwrapped
+        quotes = [quotes]
+    return {q.get("symbol"): q for q in quotes if isinstance(q, dict)}
+
+
+def _cnbc_entry_price(entries: dict[str, dict], symbol: str) -> float:
+    entry = entries.get(symbol)
     if entry is None:
-        seen = [q.get("symbol") for q in quotes]
-        raise ValueError(f"CNBC: {symbol!r} not in response (got {seen[:5]})")
+        raise ValueError(f"CNBC: {symbol!r} not in response (got {list(entries)[:5]})")
     # Off-session the price moves out of "last" into the extended-market quote
     # (that's why the futures line vanished exactly when it was needed).
     extended = entry.get("ExtendedMktQuote") or {}
@@ -1156,9 +1210,57 @@ def _fetch_cnbc_quote_last(symbol: str) -> float:
             return float(str(raw).replace(",", ""))
         except ValueError:
             continue
+    if set(entry) <= {"code", "symbol"}:
+        raise ValueError(f"CNBC: {symbol!r} unknown symbol (code={entry.get('code')})")
     raise ValueError(
         f"CNBC: {symbol!r} present but no price fields (keys: {sorted(entry)[:10]})"
     )
+
+
+def _fetch_cnbc_quote_last(symbol: str) -> float:
+    return _cnbc_entry_price(_fetch_cnbc_entries([symbol]), symbol)
+
+
+def _fetch_tradingview_es_futures() -> float:
+    """TradingView public scanner, CME_MINI:ES1! (continuous E-mini front
+    month). No key; quotes are delayed for anonymous use, which is fine for a
+    pre-/after-market direction signal."""
+    payload = {
+        "symbols": {"tickers": [TRADINGVIEW_ES_TICKER], "query": {"types": []}},
+        "columns": ["close"],
+    }
+    errors = []
+    for market in TRADINGVIEW_SCAN_MARKETS:
+        try:
+            response = browser_request(
+                "POST", TRADINGVIEW_SCAN_URL.format(market=market), json=payload
+            )
+            if response.status_code != 200:
+                raise ValueError(f"HTTP {response.status_code}")
+            for row in response.json().get("data") or []:
+                values = row.get("d") or []
+                if values and values[0] is not None:
+                    return float(values[0])
+            raise ValueError(f"no close (body: {normalize_text(response.text)[:80]})")
+        except Exception as exc:
+            errors.append(f"{market}: {str(exc)[:80]}")
+    raise ValueError("TradingView ES1!: " + "; ".join(errors))
+
+
+def _fetch_cme_es_futures() -> float:
+    """CME Group's own quotes JSON for E-mini S&P 500 (product 133); the
+    first contract with a numeric last trade is the front month."""
+    response = browser_request("GET", CME_ES_QUOTES_URL)
+    if response.status_code != 200:
+        raise ValueError(f"CME: HTTP {response.status_code}")
+    quotes = response.json().get("quotes") or []
+    for quote in quotes:
+        raw = str(quote.get("last") or "").replace(",", "").strip()
+        try:
+            return float(raw)
+        except ValueError:
+            continue
+    raise ValueError(f"CME: no numeric last in {len(quotes)} contracts")
 
 
 def _fetch_coinbase_btc() -> float:
@@ -1233,6 +1335,10 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
     if spx_futures is None:
         spx_futures = _try_source("cnbc_es", _fetch_cnbc_futures)
     if spx_futures is None:
+        spx_futures = _try_source("tradingview_es", _fetch_tradingview_es_futures)
+    if spx_futures is None:
+        spx_futures = _try_source("cme_es", _fetch_cme_es_futures)
+    if spx_futures is None:
         spx_futures = _try_source("stooq_es", _fetch_stooq_es_futures)
     if spx_price is None:
         spx_price = _try_source("cnbc", _fetch_cnbc_spx)
@@ -1277,14 +1383,11 @@ def fetch_market_prices() -> tuple[float, float, float | None]:
 def build_st_debug_block() -> str:
     """Probe every market data source with raw values/errors — shows why the
     futures (pre-/after-market) line is missing when it is."""
-    lines = ["Market sources probe:"]
+    lines = ["Market sources probe:", f"• http client (Yahoo/TV/CME): {browser_client_label()}"]
 
     try:
-        response = requests.get(
-            YAHOO_QUOTE_URL,
-            params={"symbols": "BTC-USD,^GSPC,ES=F"},
-            headers=REQUEST_HEADERS_GENERIC,
-            timeout=HTTP_TIMEOUT_SHORT,
+        response = browser_request(
+            "GET", YAHOO_QUOTE_URL, params={"symbols": "BTC-USD,^GSPC,ES=F"}
         )
         lines.append(f"• yahoo v7 quote: HTTP {response.status_code}")
         if response.ok:
@@ -1307,9 +1410,9 @@ def build_st_debug_block() -> str:
         ("yahoo v8 chart ^GSPC", lambda: _fetch_yahoo_chart_price("^GSPC")),
         ("yahoo v8 chart ES=F", lambda: _fetch_yahoo_chart_price("ES=F")),
         ("cnbc .SPX", _fetch_cnbc_spx),
-        ("cnbc @ES.1", lambda: _fetch_cnbc_quote_last("@ES.1")),
-        ("cnbc @ES", lambda: _fetch_cnbc_quote_last("@ES")),
-        ("cnbc ES.1", lambda: _fetch_cnbc_quote_last("ES.1")),
+        ("cnbc futures " + "|".join(CNBC_ES_FUTURES_SYMBOLS), _fetch_cnbc_futures),
+        ("tradingview " + TRADINGVIEW_ES_TICKER, _fetch_tradingview_es_futures),
+        ("cme E-mini", _fetch_cme_es_futures),
         ("stooq es.f", _fetch_stooq_es_futures),
         ("coinbase BTC", _fetch_coinbase_btc),
         ("coingecko BTC", _fetch_coingecko_btc),
@@ -1319,7 +1422,7 @@ def build_st_debug_block() -> str:
         try:
             lines.append(f"• {label}: {fetch():,.2f}")
         except Exception as exc:
-            lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:140]}")
+            lines.append(f"• {label} FAILED {type(exc).__name__}: {str(exc)[:220]}")
 
     lines.append("")
     lines.append("Пришлите этот вывод — по нему чинится строка futures/pre-market в /st.")
