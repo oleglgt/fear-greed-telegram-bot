@@ -96,7 +96,7 @@ AI_PROVIDERS = ("claude", "openai", "deepseek")
 NEWS_HISTORY_FILE = "news_history.json"
 NEWS_HISTORY_HOURS = 72
 BOT_STATE_FILE = "bot_state.json"
-BOT_VERSION = "v5.10.0"
+BOT_VERSION = "v5.11.0"
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Env markers the common hosting platforms inject; lets /status answer
@@ -271,6 +271,15 @@ IDEAS_SCHEDULE_WEEKDAYS = frozenset(
     int(d) for d in os.getenv("IDEAS_SCHEDULE_WEEKDAYS", "0,3").split(",") if d.strip().isdigit()
 )
 IDEAS_UNIVERSE_MAX_AGE_DAYS = 30
+# 13F is due 45 days after the quarter end (next business day if that is a
+# weekend). From the day after the deadline the universe is rebuilt at most
+# once per IDEAS_UNIVERSE_RETRY_HOURS until every tracked fund shows the new
+# quarter, for up to IDEAS_13F_CATCHUP_DAYS (late filers); without this the
+# 30-day max age kept the old quarter for weeks (built 12 Nov, Q3 due 16 Nov).
+IDEAS_13F_DEADLINE_DAYS = 45
+IDEAS_UNIVERSE_RETRY_HOURS = 20
+IDEAS_13F_CATCHUP_DAYS = 14
+EDGAR_TZ = ZoneInfo("America/New_York")
 IDEAS_TARGET_COUNT = 10
 IDEAS_MAX_ANALYST_LOOKUPS = 25  # Finnhub free tier is 60 req/min
 IDEAS_MIN_COVERAGE = 5  # analysts covering; below this the rating is noise
@@ -2863,6 +2872,57 @@ def _quarter_end_before(iso_date: str) -> str:
     return max(q for q in candidates if q < d).isoformat()
 
 
+def _13f_deadline(period_end: str):
+    """Filing deadline for a 13F covering `period_end` (weekends roll forward;
+    US holidays are not modelled, the catch-up window absorbs them)."""
+    deadline = datetime.strptime(period_end, "%Y-%m-%d").date() + timedelta(days=IDEAS_13F_DEADLINE_DAYS)
+    while deadline.weekday() >= 5:
+        deadline += timedelta(days=1)
+    return deadline
+
+
+def _latest_due_13f_period(today=None) -> tuple[str, object]:
+    """(period, deadline) of the newest quarter whose 13F deadline is over.
+
+    "Over" starts the day after the deadline: EDGAR dates filings sent after
+    17:30 ET with the next business day."""
+    today = today or datetime.now(EDGAR_TZ).date()
+    period = _quarter_end_before(today.isoformat())
+    while today <= _13f_deadline(period):
+        period = _quarter_end_before(period)
+    return period, _13f_deadline(period)
+
+
+def _pending_13f_period(newest: str, today=None) -> tuple[str, object] | None:
+    """(period, deadline) of a quarter newer than `newest` whose 13F is still
+    within its filing window, if any."""
+    today = today or datetime.now(EDGAR_TZ).date()
+    period = _quarter_end_before(today.isoformat())
+    if period > newest and today <= _13f_deadline(period):
+        return period, _13f_deadline(period)
+    return None
+
+
+def _ideas_universe_refresh_reason(universe: dict | None, now_ts: float, today=None) -> str | None:
+    """Why the 13F universe should be rebuilt now, or None to keep it."""
+    if universe is None:
+        return "no universe yet"
+    age_s = now_ts - float(universe.get("built_at", 0))
+    if age_s > IDEAS_UNIVERSE_MAX_AGE_DAYS * 86400:
+        return f"older than {IDEAS_UNIVERSE_MAX_AGE_DAYS} days"
+    if age_s < IDEAS_UNIVERSE_RETRY_HOURS * 3600:
+        return None
+    today = today or datetime.now(EDGAR_TZ).date()
+    due, deadline = _latest_due_13f_period(today)
+    if (today - deadline).days > IDEAS_13F_CATCHUP_DAYS:
+        return None
+    funds = universe.get("funds") or []
+    behind = [str(f.get("name", "?")) for f in funds if str(f.get("period", "")) < due]
+    if behind or not funds:
+        return f"13F for {due} was due {deadline}; old quarter: {', '.join(behind) or 'all'}"
+    return None
+
+
 def _fix_13f_units(holdings: dict[str, dict[str, object]], label: str) -> dict[str, dict[str, object]]:
     """Rescale a filing reported in thousands of dollars to whole dollars."""
     total = sum(float(e.get("value") or 0.0) for e in holdings.values())
@@ -3750,9 +3810,18 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
 
     try:
         universe = None if rebuild else load_ideas_universe()
-        max_age = IDEAS_UNIVERSE_MAX_AGE_DAYS * 86400
-        if universe is None or now_ts - float(universe.get("built_at", 0)) > max_age:
-            universe = build_ideas_universe()
+        reason = "rebuild requested" if rebuild else _ideas_universe_refresh_reason(universe, now_ts)
+        retry_at = float(IDEAS_CACHE.get("universe_retry_at", 0.0))
+        if reason and (universe is None or now_ts >= retry_at):
+            logger.info("ideas: rebuilding universe (%s)", reason)
+            try:
+                universe = build_ideas_universe()
+            except Exception:
+                if universe is None:
+                    raise
+                # Keep serving the previous quarter; try EDGAR again in an hour.
+                IDEAS_CACHE["universe_retry_at"] = now_ts + 3600
+                logger.exception("ideas: universe rebuild failed, keeping the previous one")
 
         candidates = universe.get("candidates", {})
         exits = universe.get("exits", {})
@@ -3892,12 +3961,25 @@ def build_ideas_block(force_refresh: bool = False, rebuild: bool = False) -> str
             lines.append("⚠️ Киты сокращают/выходят: " + "; ".join(exit_rows[:3]))
             lines.append("")
 
-        period = universe.get("funds", [{}])[0].get("period", "?") if universe.get("funds") else "?"
-        fund_names = ", ".join(f["name"] for f in universe.get("funds", []))
+        funds = universe.get("funds") or []
+        period = max((str(f.get("period", "")) for f in funds), default="") or "?"
+        fund_names = ", ".join(f["name"] for f in funds)
         built = format_cyprus_date(
             datetime.fromtimestamp(float(universe.get("built_at", now_ts)), tz=timezone.utc)
         )
         lines.append(f"13F за {period}, вселенная обновлена {built}. Фонды: {fund_names}")
+        behind = [f for f in funds if str(f.get("period", "")) < period]
+        if behind:
+            lines.append(
+                "Ещё без нового 13F: "
+                + "; ".join(f"{f['name']} ({_fmt_short_date(str(f['period']))})" for f in behind)
+            )
+        pending = _pending_13f_period(period) if period != "?" else None
+        if pending:
+            lines.append(
+                f"Следующие 13F (за {_fmt_short_date(pending[0])}) — до {_fmt_short_date(pending[1].isoformat())}, "
+                "бот подхватит их сам."
+            )
         stale = universe.get("stale_funds") or []
         if stale:
             lines.append(
@@ -3930,6 +4012,9 @@ def build_ideas_debug_block() -> str:
         )
     else:
         lines.append("• universe: not built yet")
+    due, deadline = _latest_due_13f_period()
+    reason = _ideas_universe_refresh_reason(universe, datetime.now(timezone.utc).timestamp())
+    lines.append(f"• 13F due: {due} (deadline {deadline}); auto-rebuild: {reason or 'not needed'}")
     first_cik = next(iter(IDEAS_FUNDS))
     try:
         name, filings = _fund_latest_13f_filings(first_cik)
